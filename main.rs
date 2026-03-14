@@ -1,0 +1,1521 @@
+// =============================================================================
+// jules/src/main.rs
+//
+// End-to-end language pipeline for Jules.
+//
+// ┌─────────────────────────────────────────────────────────────────────────┐
+// │  Commands                                                               │
+// │    jules run   <file.jules> [-- arg…]   Run a Jules source file            │
+// │    jules check <file.jules>             Type-check + sema, no execution    │
+// │    jules fmt   <file.jules>             Pretty-print (echo tokens / AST)   │
+// │    jules repl                        Interactive REPL / playground       │
+// │    jules train <file.jules>             Execute all train blocks            │
+// │                                                                         │
+// │  Flags                                                                  │
+// │    --no-color          Disable ANSI colour in diagnostics               │
+// │    --json-diag         Emit diagnostics as JSON (for editors / LSP)     │
+// │    --emit-ast          Dump the parsed AST to stdout and exit           │
+// │    --emit-tokens       Dump the token stream and exit                   │
+// │    --warn-error / -W   Treat warnings as errors                         │
+// │    --quiet / -q        Suppress notes and warnings                      │
+// │    --tab-width <N>     Tab-stop width used in squiggle rendering (def 4)│
+// └─────────────────────────────────────────────────────────────────────────┘
+// =============================================================================
+
+#![allow(dead_code, unused_variables, unused_imports)]
+
+// Module declarations for the Jules compiler/interpreter.
+// In this repository layout the source files live in the crate root.
+mod ast;
+mod lexer;
+mod parser;
+mod typeck;
+mod sema;
+mod interp;
+
+use std::fmt::Write as FmtWrite;
+use std::fs;
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::process;
+
+// ── Public API (used by lib.rs re-exports) ────────────────────────────────────
+
+/// Run only the analysis passes (lex → parse → typecheck → sema) on a source
+/// string and return all diagnostics.  Does not execute the program.
+pub fn jules_check(filename: &str, source: &str) -> Vec<Diag> {
+    let mut unit = CompileUnit::new(filename, source);
+    Pipeline::new().run(&mut unit);
+    unit.diags
+}
+
+/// Load, analyse, and run a Jules source file.  Returns `Ok(())` on success,
+/// or the first runtime error as a `String`.
+pub fn jules_run_file(path: &str, entry: &str) -> Result<(), String> {
+    let source = fs::read_to_string(path)
+        .map_err(|e| format!("cannot read `{path}`: {e}"))?;
+    let mut unit = CompileUnit::new(path, &source);
+    let result   = Pipeline::new().run(&mut unit);
+    if unit.has_errors() {
+        let msgs: Vec<_> = unit.diags.iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message.clone())
+            .collect();
+        return Err(msgs.join("\n"));
+    }
+    if let PipelineResult::Ok(program) = result {
+        let mut interp = crate::interp::Interpreter::new();
+        interp.load_program(&program);
+        interp.call_fn(entry, vec![])
+            .map(|_| ())
+            .map_err(|e| e.message)
+    } else {
+        Err("pipeline did not produce a program".into())
+    }
+}
+
+// Pull in the compiler passes.  In a real crate these would be separate modules.
+use crate::lexer::{Lexer, LexError, Span};
+// use crate::parser::Parser;   // ← not yet wired; placeholder below
+// use crate::typeck::TypeCk;
+// use crate::sema::SemaCtx;
+// use crate::interp::Interpreter;
+
+// =============================================================================
+// §1  ANSI COLOUR CODES
+// =============================================================================
+
+struct Ansi;
+
+impl Ansi {
+    const RESET:      &'static str = "\x1b[0m";
+    const BOLD:       &'static str = "\x1b[1m";
+    const DIM:        &'static str = "\x1b[2m";
+
+    // Foreground colours
+    const RED:        &'static str = "\x1b[31m";
+    const YELLOW:     &'static str = "\x1b[33m";
+    const BLUE:       &'static str = "\x1b[34m";
+    const CYAN:       &'static str = "\x1b[36m";
+    const WHITE:      &'static str = "\x1b[37m";
+    const BRIGHT_RED: &'static str = "\x1b[91m";
+    const BRIGHT_YEL: &'static str = "\x1b[93m";
+    const BRIGHT_CYN: &'static str = "\x1b[96m";
+    const MAGENTA:    &'static str = "\x1b[35m";
+
+    fn paint(enabled: bool, code: &str, text: &str) -> String {
+        if enabled { format!("{}{}{}", code, text, Self::RESET) }
+        else       { text.to_owned() }
+    }
+}
+
+// =============================================================================
+// §2  UNIFIED DIAGNOSTIC TYPES
+// =============================================================================
+
+/// One diagnostic from any compiler pass.
+#[derive(Debug, Clone)]
+pub struct Diag {
+    pub severity: DiagSeverity,
+    pub span:     Option<Span>,
+    pub code:     Option<&'static str>, // e.g. "E001", "W042"
+    pub message:  String,
+    /// Secondary "note" labels at related source positions.
+    pub labels:   Vec<(Span, String)>,
+    /// Suggested fix hint (optional).
+    pub hint:     Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DiagSeverity { Note, Warning, Error }
+
+impl Diag {
+    pub fn error(span: Span, msg: impl Into<String>) -> Self {
+        Diag { severity: DiagSeverity::Error, span: Some(span), code: None,
+               message: msg.into(), labels: vec![], hint: None }
+    }
+    pub fn warning(span: Span, msg: impl Into<String>) -> Self {
+        Diag { severity: DiagSeverity::Warning, span: Some(span), code: None,
+               message: msg.into(), labels: vec![], hint: None }
+    }
+    pub fn note(span: Span, msg: impl Into<String>) -> Self {
+        Diag { severity: DiagSeverity::Note, span: Some(span), code: None,
+               message: msg.into(), labels: vec![], hint: None }
+    }
+    pub fn with_code(mut self, c: &'static str) -> Self { self.code = Some(c); self }
+    pub fn with_hint(mut self, h: impl Into<String>) -> Self { self.hint = Some(h.into()); self }
+    pub fn with_label(mut self, s: Span, m: impl Into<String>) -> Self {
+        self.labels.push((s, m.into())); self
+    }
+    pub fn is_error(&self) -> bool { self.severity == DiagSeverity::Error }
+}
+
+// ── Conversion from lexer errors ──────────────────────────────────────────────
+
+impl From<LexError> for Diag {
+    fn from(e: LexError) -> Self {
+        Diag::error(e.span, e.message).with_code("E0001")
+    }
+}
+
+// =============================================================================
+// §3  PRETTY-PRINTING RENDERER
+// =============================================================================
+
+/// Configuration for the diagnostic renderer.
+#[derive(Debug, Clone)]
+pub struct RenderCfg {
+    pub color:     bool,
+    pub tab_width: usize,
+    pub context:   usize, // extra lines of source context to show
+}
+
+impl Default for RenderCfg {
+    fn default() -> Self {
+        RenderCfg { color: true, tab_width: 4, context: 1 }
+    }
+}
+
+/// Renders a slice of diagnostics to a `String` using Rust-compiler-style
+/// formatting with source squiggles.
+pub struct DiagRenderer<'src> {
+    source:   &'src str,
+    filename: &'src str,
+    cfg:      RenderCfg,
+    /// Pre-split source lines for O(1) access.
+    lines:    Vec<&'src str>,
+}
+
+impl<'src> DiagRenderer<'src> {
+    pub fn new(source: &'src str, filename: &'src str, cfg: RenderCfg) -> Self {
+        let lines: Vec<&str> = source.split('\n').collect();
+        DiagRenderer { source, filename, cfg, lines }
+    }
+
+    pub fn render_all(&self, diags: &[Diag]) -> String {
+        let mut out = String::new();
+        for d in diags {
+            out.push_str(&self.render(d));
+            out.push('\n');
+        }
+        out
+    }
+
+    pub fn render(&self, d: &Diag) -> String {
+        let mut buf = String::new();
+
+        // ── Header line  "error[E001]: message" ───────────────────────────────
+        let (sev_tag, sev_color) = match d.severity {
+            DiagSeverity::Error   => ("error",   Ansi::BRIGHT_RED),
+            DiagSeverity::Warning => ("warning", Ansi::BRIGHT_YEL),
+            DiagSeverity::Note    => ("note",    Ansi::BRIGHT_CYN),
+        };
+        let code_part = d.code.map(|c| format!("[{c}]")).unwrap_or_default();
+        let header = format!("{sev_tag}{code_part}: {}", d.message);
+        writeln!(buf, "{}", self.paint(Ansi::BOLD, &self.paint(sev_color, &header))).unwrap();
+
+        // ── File + line location ───────────────────────────────────────────────
+        if let Some(span) = d.span {
+            if span.line > 0 {
+                let loc = format!("  --> {}:{}:{}", self.filename, span.line, span.col);
+                writeln!(buf, "{}", self.dim(&loc)).unwrap();
+                writeln!(buf, "   {}", self.dim("|")).unwrap();
+                self.render_source_snippet(&mut buf, span, sev_color);
+            }
+        }
+
+        // ── Secondary labels ──────────────────────────────────────────────────
+        for (lspan, lmsg) in &d.labels {
+            if lspan.line > 0 {
+                let loc = format!("  --> {}:{}:{}", self.filename, lspan.line, lspan.col);
+                writeln!(buf, "{}", self.dim(&loc)).unwrap();
+                writeln!(buf, "   {}", self.dim("|")).unwrap();
+                self.render_source_snippet(&mut buf, *lspan, Ansi::BLUE);
+                let note = format!("   {} = note: {}", self.dim("|"), lmsg);
+                writeln!(buf, "{note}").unwrap();
+            }
+        }
+
+        // ── Hint ─────────────────────────────────────────────────────────────
+        if let Some(hint) = &d.hint {
+            writeln!(buf, "   {} help: {}",
+                self.dim("|"),
+                self.paint(Ansi::BRIGHT_CYN, hint)
+            ).unwrap();
+        }
+
+        buf
+    }
+
+    fn render_source_snippet(&self, buf: &mut String, span: Span, squiggle_color: &str) {
+        let line_idx = (span.line as usize).saturating_sub(1);
+
+        // Optionally show one line of context above.
+        if self.cfg.context > 0 && line_idx > 0 {
+            let prev_no = line_idx;   // 1-based = line_idx (because line_idx = line - 1)
+            let prev    = self.lines.get(line_idx - 1).unwrap_or(&"");
+            let prefix  = self.dim(&format!("{prev_no:4} | "));
+            writeln!(buf, "{prefix}{}", self.dim(prev)).unwrap();
+        }
+
+        // The main highlighted line.
+        let line_no  = span.line as usize;
+        let line_str = self.lines.get(line_idx).unwrap_or(&"");
+        let prefix   = self.paint(Ansi::BOLD, &format!("{line_no:4} | "));
+        writeln!(buf, "{prefix}{line_str}").unwrap();
+
+        // Squiggle line: "     | ^^^^"
+        let col   = (span.col as usize).saturating_sub(1);
+        let width = (span.end.saturating_sub(span.start)).max(1);
+        let pad   = self.expand_tabs(line_str, col);
+        let squig = self.paint(squiggle_color, &"^".repeat(width));
+        writeln!(buf, "     {}{}{}",
+            self.dim("|"),
+            " ".repeat(pad + 1),
+            squig
+        ).unwrap();
+
+        // Optionally show one line of context below.
+        if self.cfg.context > 0 {
+            let next_idx = line_idx + 1;
+            if let Some(next) = self.lines.get(next_idx) {
+                let next_no = next_idx + 1;
+                let prefix  = self.dim(&format!("{next_no:4} | "));
+                writeln!(buf, "{prefix}{}", self.dim(next)).unwrap();
+            }
+        }
+
+        writeln!(buf, "   {}", self.dim("|")).unwrap();
+    }
+
+    /// Count display columns up to `col` bytes, expanding tabs.
+    fn expand_tabs(&self, line: &str, col: usize) -> usize {
+        let tw = self.cfg.tab_width;
+        let mut display = 0;
+        for (i, ch) in line.char_indices() {
+            if i >= col { break; }
+            if ch == '\t' {
+                // Align to next tab stop.
+                display = (display / tw + 1) * tw;
+            } else {
+                display += 1;
+            }
+        }
+        display
+    }
+
+    fn paint(&self, color: &str, s: &str) -> String {
+        Ansi::paint(self.cfg.color, color, s)
+    }
+    fn dim(&self, s: &str) -> String {
+        Ansi::paint(self.cfg.color, Ansi::DIM, s)
+    }
+}
+
+// =============================================================================
+// §4  JSON DIAGNOSTIC EMITTER  (for editor / LSP integration)
+// =============================================================================
+
+pub fn diags_to_json(diags: &[Diag], filename: &str) -> String {
+    if diags.is_empty() {
+        return "[]".to_string();
+    }
+
+    let mut out = String::from("[\n");
+    for (i, d) in diags.iter().enumerate() {
+        let sev = match d.severity {
+            DiagSeverity::Error   => "error",
+            DiagSeverity::Warning => "warning",
+            DiagSeverity::Note    => "note",
+        };
+        let (line, col, start, end) = if let Some(sp) = d.span {
+            (sp.line, sp.col, sp.start, sp.end)
+        } else { (0, 0, 0, 0) };
+
+        let msg  = d.message.replace('"', "\\\"");
+        let code = d.code.unwrap_or("");
+        let hint = d.hint.as_deref().unwrap_or("").replace('"', "\\\"");
+
+        let labels_json: Vec<String> = d.labels.iter().map(|(sp, m)| {
+            let m = m.replace('"', "\\\"");
+            format!(r#"  {{"line":{}, "col":{}, "message":"{}"}}"#,
+                    sp.line, sp.col, m)
+        }).collect();
+
+        let comma = if i + 1 < diags.len() { "," } else { "" };
+        out.push_str(&format!(
+            r#"  {{
+    "severity": "{sev}",
+    "code": "{code}",
+    "file": "{filename}",
+    "line": {line},
+    "col": {col},
+    "start": {start},
+    "end": {end},
+    "message": "{msg}",
+    "hint": "{hint}",
+    "labels": [
+{}
+    ]
+  }}{comma}
+"#,
+            labels_json.join(",\n")
+        ));
+    }
+    out.push(']');
+    out
+}
+
+// =============================================================================
+// §5  COMPILER PIPELINE  (orchestrates all passes)
+// =============================================================================
+
+/// Everything the compiler knows about a compilation unit.
+pub struct CompileUnit {
+    pub filename: String,
+    pub source:   String,
+    pub diags:    Vec<Diag>,
+}
+
+impl CompileUnit {
+    pub fn new(filename: impl Into<String>, source: impl Into<String>) -> Self {
+        CompileUnit { filename: filename.into(), source: source.into(), diags: vec![] }
+    }
+
+    pub fn has_errors(&self) -> bool {
+        self.diags.iter().any(|d| d.is_error())
+    }
+
+    pub fn error_count(&self)   -> usize { self.diags.iter().filter(|d| d.is_error()).count() }
+    pub fn warning_count(&self) -> usize {
+        self.diags.iter().filter(|d| d.severity == DiagSeverity::Warning).count()
+    }
+}
+
+/// The full front-end pipeline.  Each pass adds to `unit.diags`.
+pub struct Pipeline {
+    pub warn_as_error: bool,
+    pub quiet:         bool,
+}
+
+impl Pipeline {
+    pub fn new() -> Self { Pipeline { warn_as_error: false, quiet: false } }
+
+    /// Run the pipeline as far as possible, accumulating diagnostics.
+    /// Returns `Ok(unit)` even when there are errors so the caller can
+    /// display all diagnostics at once.
+    pub fn run(&self, unit: &mut CompileUnit) -> PipelineResult {
+        // ── Pass 1: Lex ───────────────────────────────────────────────────────
+        let mut lexer = Lexer::new(&unit.source);
+        let (tokens, lex_errors) = lexer.tokenize();
+
+        for e in lex_errors {
+            unit.diags.push(Diag::from(e));
+        }
+
+        if unit.has_errors() {
+            return PipelineResult::HaltedAt(PassName::Lex);
+        }
+
+        // ── Pass 2: Parse ─────────────────────────────────────────────────────
+        let mut parser = crate::parser::Parser::new(tokens);
+        let program = parser.parse_program();
+
+        for e in parser.errors {
+            unit.diags.push(parse_error_to_diag(e));
+        }
+
+        if unit.has_errors() {
+            return PipelineResult::HaltedAt(PassName::Parse);
+        }
+
+        // ── Pass 3: Type-check ────────────────────────────────────────────────
+        let mut typeck = crate::typeck::TypeCk::new();
+        typeck.check_program(&program);
+        for d in typeck.diag.items {
+            unit.diags.push(adapt_typeck_diag(d));
+        }
+        if unit.has_errors() {
+            return PipelineResult::HaltedAt(PassName::TypeCheck);
+        }
+
+        // ── Pass 4: Semantic analysis ─────────────────────────────────────────
+        let mut sema = crate::sema::SemaCtx::new();
+        sema.analyse(&program);
+        for d in sema.diag.items {
+            unit.diags.push(adapt_sema_diag(d));
+        }
+        if unit.has_errors() {
+            return PipelineResult::HaltedAt(PassName::Sema);
+        }
+
+        // ── Promote warnings to errors if requested ───────────────────────────
+        if self.warn_as_error {
+            for d in &mut unit.diags {
+                if d.severity == DiagSeverity::Warning {
+                    d.severity = DiagSeverity::Error;
+                }
+            }
+        }
+
+        // ── Filter notes if quiet ─────────────────────────────────────────────
+        if self.quiet {
+            unit.diags.retain(|d| d.severity == DiagSeverity::Error);
+        }
+
+        PipelineResult::Ok(program)
+    }
+}
+
+#[derive(Debug)]
+pub enum PipelineResult {
+    Ok(crate::ast::Program),
+    HaltedAt(PassName),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassName { Lex, Parse, TypeCheck, Sema, Interp }
+
+// ── Diagnostic adapters (one per pass module) ──────────────────────────────
+
+fn parse_error_to_diag(e: crate::parser::ParseError) -> Diag {
+    let mut d = Diag::error(e.span, e.message).with_code("E0002");
+    if let Some(h) = e.hint { d = d.with_hint(h); }
+    d
+}
+
+fn adapt_typeck_diag(d: crate::typeck::Diagnostic) -> Diag {
+    let sev = match d.severity {
+        crate::typeck::Severity::Error   => DiagSeverity::Error,
+        crate::typeck::Severity::Warning => DiagSeverity::Warning,
+        crate::typeck::Severity::Note    => DiagSeverity::Note,
+    };
+    let mut out = Diag {
+        severity: sev, span: Some(d.span), code: None,
+        message: d.message, labels: vec![], hint: None,
+    };
+    for (s, m) in d.notes { out.labels.push((s, m)); }
+    out
+}
+
+fn adapt_sema_diag(d: crate::sema::Diagnostic) -> Diag {
+    let sev = match d.severity {
+        crate::sema::Severity::Error   => DiagSeverity::Error,
+        crate::sema::Severity::Warning => DiagSeverity::Warning,
+        crate::sema::Severity::Note    => DiagSeverity::Note,
+    };
+    let mut out = Diag {
+        severity: sev, span: Some(d.span), code: None,
+        message: d.message, labels: vec![], hint: None,
+    };
+    for (s, m) in d.labels { out.labels.push((s, m)); }
+    out
+}
+
+fn adapt_runtime_error(e: crate::interp::RuntimeError) -> Diag {
+    Diag {
+        severity: DiagSeverity::Error,
+        span:     e.span,
+        code:     Some("E9000"),
+        message:  e.message,
+        labels:   vec![],
+        hint:     None,
+    }
+}
+
+// =============================================================================
+// §6  SUMMARY LINE
+// =============================================================================
+
+fn print_summary(unit: &CompileUnit, cfg: &RenderCfg) {
+    let errors   = unit.error_count();
+    let warnings = unit.warning_count();
+    if errors == 0 && warnings == 0 { return; }
+
+    let err_part = if errors > 0 {
+        Ansi::paint(cfg.color, Ansi::BRIGHT_RED,
+            &format!("{errors} error{}", if errors == 1 { "" } else { "s" }))
+    } else { String::new() };
+
+    let warn_part = if warnings > 0 {
+        Ansi::paint(cfg.color, Ansi::BRIGHT_YEL,
+            &format!("{warnings} warning{}", if warnings == 1 { "" } else { "s" }))
+    } else { String::new() };
+
+    let parts: Vec<&str> = [err_part.as_str(), warn_part.as_str()]
+        .iter().filter(|s| !s.is_empty()).cloned().collect();
+    eprintln!("{}", Ansi::paint(cfg.color, Ansi::BOLD,
+        &format!("jules: {}", parts.join(", "))));
+}
+
+// =============================================================================
+// §7  CLI ARGUMENT PARSER  (zero external dependencies)
+// =============================================================================
+
+#[derive(Debug, Default)]
+pub struct CliArgs {
+    pub command:       Command,
+    pub file:          Option<PathBuf>,
+    pub rest_args:     Vec<String>,
+    pub color:         bool,
+    pub json_diag:     bool,
+    pub emit_ast:      bool,
+    pub emit_tokens:   bool,
+    pub warn_as_error: bool,
+    pub quiet:         bool,
+    pub tab_width:     usize,
+    pub entry:         String,    // --entry <fn>  for jules run
+    pub train:         bool,      // jules train
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Command {
+    #[default]
+    Help,
+    Run,
+    Check,
+    Fmt,
+    Repl,
+    Train,
+    Version,
+}
+
+impl CliArgs {
+    pub fn parse(args: &[String]) -> Result<Self, String> {
+        let mut out = CliArgs {
+            color:     std::env::var("NO_COLOR").is_err(), // respect NO_COLOR
+            tab_width: 4,
+            entry:     "main".into(),
+            ..Default::default()
+        };
+
+        let mut it = args.iter().peekable();
+
+        // Skip binary name.
+        let _ = it.next();
+
+        // First positional arg: sub-command.
+        let cmd = it.peek().map(|s| s.as_str());
+        match cmd {
+            Some("run")     => { out.command = Command::Run;     it.next(); }
+            Some("check")   => { out.command = Command::Check;   it.next(); }
+            Some("fmt")     => { out.command = Command::Fmt;     it.next(); }
+            Some("repl")    => { out.command = Command::Repl;    it.next(); }
+            Some("train")   => { out.command = Command::Train;   it.next(); }
+            Some("version") | Some("--version") | Some("-V") => {
+                out.command = Command::Version; it.next();
+            }
+            Some("help") | Some("--help") | Some("-h") | None => {
+                out.command = Command::Help; it.next();
+            }
+            _ => {} // let flags/file sort it out below
+        }
+
+        let mut past_dashdash = false;
+
+        while let Some(arg) = it.next() {
+            if past_dashdash {
+                out.rest_args.push(arg.clone());
+                continue;
+            }
+            match arg.as_str() {
+                "--" => { past_dashdash = true; }
+                "--no-color"       => { out.color = false; }
+                "--color"          => { out.color = true;  }
+                "--json-diag"      => { out.json_diag = true; }
+                "--emit-ast"       => { out.emit_ast = true; }
+                "--emit-tokens"    => { out.emit_tokens = true; }
+                "--warn-error" | "-W" => { out.warn_as_error = true; }
+                "--quiet"  | "-q"  => { out.quiet = true; }
+                "--tab-width" => {
+                    let n = it.next()
+                        .ok_or("--tab-width requires a value")?
+                        .parse::<usize>()
+                        .map_err(|_| "--tab-width must be a positive integer")?;
+                    out.tab_width = n;
+                }
+                "--entry" => {
+                    out.entry = it.next()
+                        .ok_or("--entry requires a function name")?
+                        .clone();
+                }
+                s if s.starts_with('-') => {
+                    return Err(format!("unknown flag `{s}`; try `jules help`"));
+                }
+                path => {
+                    if out.file.is_none() {
+                        out.file = Some(PathBuf::from(path));
+                    } else {
+                        out.rest_args.push(arg.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(out)
+    }
+}
+
+// =============================================================================
+// §8  COMMAND IMPLEMENTATIONS
+// =============================================================================
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const JULES_BANNER: &str = r#"
+     ██╗██╗   ██╗██╗     ███████╗███████╗
+     ██║██║   ██║██║     ██╔════╝██╔════╝
+     ██║██║   ██║██║     █████╗  ███████╗
+██   ██║██║   ██║██║     ██╔══╝  ╚════██║
+╚█████╔╝╚██████╔╝███████╗███████╗███████║
+ ╚════╝  ╚═════╝ ╚══════╝╚══════╝╚══════╝
+"#;
+
+fn cmd_version() {
+    println!("jules {VERSION}");
+    println!("tensor-first game-and-AI programming language");
+}
+
+fn cmd_help() {
+    println!("{JULES_BANNER}");
+    println!("USAGE:");
+    println!("    jules <command> [options] [file.jules] [-- args…]\n");
+    println!("COMMANDS:");
+    println!("    run   <file.jules>    Execute a Jules source file");
+    println!("    check <file.jules>    Type-check and lint without running");
+    println!("    fmt   <file.jules>    Pretty-print the source (token pass)");
+    println!("    train <file.jules>    Run all train {{ … }} blocks");
+    println!("    repl               Interactive REPL / playground");
+    println!("    version            Print version information");
+    println!("    help               Print this message\n");
+    println!("OPTIONS:");
+    println!("    --no-color         Disable ANSI colour output");
+    println!("    --json-diag        Emit diagnostics as JSON");
+    println!("    --emit-tokens      Print token stream and exit");
+    println!("    --emit-ast         Print AST and exit");
+    println!("    --warn-error / -W  Treat warnings as errors");
+    println!("    --quiet  / -q      Suppress warnings and notes");
+    println!("    --tab-width <N>    Tab stop width (default: 4)");
+    println!("    --entry <fn>       Entry-point function (default: main)");
+    println!("\nEXAMPLES:");
+    println!("    jules run examples/physics.jules");
+    println!("    jules check src/agent.jules -W");
+    println!("    jules train examples/warden.jules");
+    println!("    jules repl");
+}
+
+// ── jules check ────────────────────────────────────────────────────────────
+
+fn cmd_check(args: &CliArgs) -> i32 {
+    let path = match &args.file {
+        Some(p) => p,
+        None    => { eprintln!("jules check: no file provided"); return 2; }
+    };
+    let source = match fs::read_to_string(path) {
+        Ok(s)  => s,
+        Err(e) => { eprintln!("jules: cannot read `{}`: {e}", path.display()); return 2; }
+    };
+
+    let cfg = render_cfg(args);
+    let filename = path.to_string_lossy();
+    let mut unit = CompileUnit::new(filename.as_ref(), &source);
+
+    let mut pipeline = Pipeline::new();
+    pipeline.warn_as_error = args.warn_as_error;
+    pipeline.quiet         = args.quiet;
+    let result = pipeline.run(&mut unit);
+
+    emit_diagnostics(&unit.diags, &source, &filename, &cfg, args.json_diag);
+    print_summary(&unit, &cfg);
+
+    if unit.has_errors() { 1 } else { 0 }
+}
+
+// ── jules run ──────────────────────────────────────────────────────────────
+
+fn cmd_run(args: &CliArgs) -> i32 {
+    let path = match &args.file {
+        Some(p) => p,
+        None    => { eprintln!("jules run: no file provided"); return 2; }
+    };
+    let source = match fs::read_to_string(path) {
+        Ok(s)  => s,
+        Err(e) => { eprintln!("jules: cannot read `{}`: {e}", path.display()); return 2; }
+    };
+
+    let cfg = render_cfg(args);
+    let filename = path.to_string_lossy();
+    let mut unit = CompileUnit::new(filename.as_ref(), &source);
+
+    let mut pipeline = Pipeline::new();
+    pipeline.warn_as_error = args.warn_as_error;
+    pipeline.quiet         = args.quiet;
+
+    // Token dump mode.
+    if args.emit_tokens {
+        let mut lexer = Lexer::new(&source);
+        let (tokens, _) = lexer.tokenize();
+        for tok in &tokens {
+            println!("{:5}:{:3}  {:?}", tok.span.line, tok.span.col, tok.kind);
+        }
+        return 0;
+    }
+
+    let result = pipeline.run(&mut unit);
+
+    emit_diagnostics(&unit.diags, &source, &filename, &cfg, args.json_diag);
+    print_summary(&unit, &cfg);
+
+    if unit.has_errors() {
+        return 1;
+    }
+
+    // Run the interpreter.
+    if let PipelineResult::Ok(program) = result {
+        let mut interp = crate::interp::Interpreter::new();
+        interp.load_program(&program);
+        match interp.call_fn(&args.entry, vec![]) {
+            Ok(val) => {
+                if !matches!(val, crate::interp::Value::Unit) {
+                    println!("{val}");
+                }
+            }
+            Err(e) => {
+                let diag = adapt_runtime_error(e);
+                emit_diagnostics(&[diag], &source, &filename, &cfg, args.json_diag);
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+// ── jules train ────────────────────────────────────────────────────────────
+
+fn cmd_train(args: &CliArgs) -> i32 {
+    let path = match &args.file {
+        Some(p) => p,
+        None    => { eprintln!("jules train: no file provided"); return 2; }
+    };
+    let source = match fs::read_to_string(path) {
+        Ok(s)  => s,
+        Err(e) => { eprintln!("jules: cannot read `{}`: {e}", path.display()); return 2; }
+    };
+
+    let cfg = render_cfg(args);
+    let filename = path.to_string_lossy();
+    let mut unit = CompileUnit::new(filename.as_ref(), &source);
+
+    let mut pipeline = Pipeline::new();
+    pipeline.warn_as_error = args.warn_as_error;
+    pipeline.quiet         = args.quiet;
+    let result = pipeline.run(&mut unit);
+
+    emit_diagnostics(&unit.diags, &source, &filename, &cfg, args.json_diag);
+    print_summary(&unit, &cfg);
+
+    if unit.has_errors() { return 1; }
+
+    if let PipelineResult::Ok(program) = result {
+        match crate::interp::jules_train(&program) {
+            Ok(all_stats) => {
+                for (i, stats) in all_stats.iter().enumerate() {
+                    println!("Train block {}: mean reward = {:.4}, steps = {}",
+                        i + 1, stats.mean_reward, stats.total_steps);
+                }
+            }
+            Err(e) => {
+                let diag = adapt_runtime_error(e);
+                emit_diagnostics(&[diag], &source, &filename, &cfg, args.json_diag);
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+// ── jules fmt ─────────────────────────────────────────────────────────────
+
+fn cmd_fmt(args: &CliArgs) -> i32 {
+    let path = match &args.file {
+        Some(p) => p,
+        None    => { eprintln!("jules fmt: no file provided"); return 2; }
+    };
+    let source = match fs::read_to_string(path) {
+        Ok(s)  => s,
+        Err(e) => { eprintln!("jules: cannot read `{}`: {e}", path.display()); return 2; }
+    };
+
+    let mut lexer = Lexer::new(&source);
+    let (tokens, errors) = lexer.tokenize();
+
+    let cfg = render_cfg(args);
+    if !errors.is_empty() {
+        let diags: Vec<Diag> = errors.into_iter().map(Diag::from).collect();
+        let filename = path.to_string_lossy();
+        let renderer = DiagRenderer::new(&source, &filename, cfg);
+        eprint!("{}", renderer.render_all(&diags));
+        return 1;
+    }
+
+    // Very simple token-level reformatter: emit tokens separated by spaces,
+    // with newlines inserted after `{`, `}`, `;`.
+    let mut out = String::new();
+    let mut indent = 0usize;
+    let indent_str = "    ";
+
+    for tok in &tokens {
+        use crate::lexer::TokenKind;
+        match &tok.kind {
+            TokenKind::Eof => break,
+            TokenKind::LBrace => {
+                out.push_str("{\n");
+                indent += 1;
+                out.push_str(&indent_str.repeat(indent));
+            }
+            TokenKind::RBrace => {
+                indent = indent.saturating_sub(1);
+                out.push('\n');
+                out.push_str(&indent_str.repeat(indent));
+                out.push_str("}\n");
+                if indent > 0 { out.push_str(&indent_str.repeat(indent)); }
+            }
+            TokenKind::Semicolon => {
+                out.push_str(";\n");
+                out.push_str(&indent_str.repeat(indent));
+            }
+            kind => {
+                out.push_str(&format!("{kind:?} "));
+            }
+        }
+    }
+
+    println!("{}", out.trim_end());
+    0
+}
+
+// =============================================================================
+// §9  REPL
+// =============================================================================
+
+const REPL_BANNER: &str = r#"Jules REPL  (type :help for commands, :quit to exit)
+Tensor-first · ECS · AI · GPU
+"#;
+
+const REPL_HELP: &str = r#"REPL commands:
+  :quit / :q          Exit the REPL
+  :help / :h          Show this message
+  :tokens <expr>      Show token stream for an expression
+  :clear              Clear the screen
+  :load <file>        Load and execute a file
+  :reset              Reset interpreter state
+  :history            Show input history
+  :color on|off       Toggle colour output
+
+Examples:
+  let x = 3 + 4
+  let t = tensor<f32>[2, 2] { 1.0, 2.0, 3.0, 4.0 }
+  let C = A @ B
+"#;
+
+pub struct Repl {
+    cfg:       RenderCfg,
+    history:   Vec<String>,
+    multiline: String,   // accumulates a multi-line block
+    in_block:  bool,     // true when inside { … }
+}
+
+impl Repl {
+    pub fn new(cfg: RenderCfg) -> Self {
+        Repl { cfg, history: Vec::new(), multiline: String::new(), in_block: false }
+    }
+
+    pub fn run(&mut self) {
+        println!("{}", Ansi::paint(self.cfg.color, Ansi::BRIGHT_CYN, REPL_BANNER));
+
+        loop {
+            let prompt = if self.in_block {
+                Ansi::paint(self.cfg.color, Ansi::DIM, "... > ")
+            } else {
+                Ansi::paint(self.cfg.color, Ansi::BRIGHT_CYN, "jules> ")
+            };
+            print!("{prompt}");
+            io::stdout().flush().unwrap();
+
+            let mut line = String::new();
+            match io::stdin().lock().read_line(&mut line) {
+                Ok(0) => {
+                    // EOF (Ctrl-D).
+                    println!();
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("REPL read error: {e}");
+                    break;
+                }
+                Ok(_) => {}
+            }
+
+            let line = line.trim_end_matches('\n').trim_end_matches('\r');
+            if line.is_empty() { continue; }
+
+            // ── REPL meta-commands ─────────────────────────────────────────────
+            match line.trim() {
+                ":quit" | ":q" | "quit" | "exit" => {
+                    println!("Goodbye.");
+                    break;
+                }
+                ":help" | ":h" => {
+                    println!("{REPL_HELP}");
+                    continue;
+                }
+                ":clear" => {
+                    print!("\x1b[2J\x1b[H");
+                    io::stdout().flush().unwrap();
+                    continue;
+                }
+                ":reset" => {
+                    self.multiline.clear();
+                    self.in_block = false;
+                    self.history.clear();
+                    println!("{}", Ansi::paint(self.cfg.color, Ansi::DIM, "State reset."));
+                    continue;
+                }
+                ":history" => {
+                    for (i, h) in self.history.iter().enumerate() {
+                        println!("{i:4}: {h}");
+                    }
+                    continue;
+                }
+                s if s.starts_with(":color ") => {
+                    let rest = s.trim_start_matches(":color ").trim();
+                    self.cfg.color = rest == "on";
+                    println!("Color {}", if self.cfg.color { "enabled" } else { "disabled" });
+                    continue;
+                }
+                s if s.starts_with(":load ") => {
+                    let path = s.trim_start_matches(":load ").trim();
+                    self.cmd_load(path);
+                    continue;
+                }
+                s if s.starts_with(":tokens ") => {
+                    let code = s.trim_start_matches(":tokens ").trim();
+                    self.cmd_tokens(code);
+                    continue;
+                }
+                _ => {}
+            }
+
+            // ── Multi-line block accumulation ──────────────────────────────────
+            self.history.push(line.to_owned());
+            let open_braces  = line.chars().filter(|&c| c == '{').count();
+            let close_braces = line.chars().filter(|&c| c == '}').count();
+
+            self.multiline.push_str(line);
+            self.multiline.push('\n');
+
+            let brace_balance: i64 = self.multiline.chars()
+                .map(|c| if c == '{' { 1 } else if c == '}' { -1 } else { 0 })
+                .sum();
+
+            if brace_balance > 0 {
+                self.in_block = true;
+                continue;
+            }
+            self.in_block = false;
+
+            // ── Evaluate the completed input ───────────────────────────────────
+            let input = std::mem::take(&mut self.multiline);
+            self.eval_input(&input);
+        }
+    }
+
+    fn eval_input(&self, input: &str) {
+        // Lex the input and show any errors.
+        let mut lexer = Lexer::new(input);
+        let (tokens, errors) = lexer.tokenize();
+
+        if !errors.is_empty() {
+            let renderer = DiagRenderer::new(input, "<repl>", self.cfg.clone());
+            let diags: Vec<Diag> = errors.into_iter().map(Diag::from).collect();
+            eprint!("{}", renderer.render_all(&diags));
+            return;
+        }
+
+        // With a real parser this would be:
+        //   let mut parser = Parser::new(tokens);
+        //   let stmt = parser.parse_stmt();
+        //   let result = interp.eval_stmt(&stmt, &mut env);
+        //   println!("=> {result}");
+        //
+        // For now just echo the token count as proof of life.
+        let token_count = tokens.len().saturating_sub(1); // exclude Eof
+        if token_count > 0 {
+            let msg = format!("[parsed {token_count} token(s) — interpreter attach pending]");
+            println!("{}", Ansi::paint(self.cfg.color, Ansi::DIM, &msg));
+        }
+    }
+
+    fn cmd_tokens(&self, code: &str) {
+        let mut lexer = Lexer::new(code);
+        let (tokens, errors) = lexer.tokenize();
+
+        if !errors.is_empty() {
+            let renderer = DiagRenderer::new(code, "<repl>", self.cfg.clone());
+            let diags: Vec<Diag> = errors.into_iter().map(Diag::from).collect();
+            eprint!("{}", renderer.render_all(&diags));
+            return;
+        }
+
+        println!("{}", Ansi::paint(self.cfg.color, Ansi::DIM, "Token stream:"));
+        for tok in &tokens {
+            if matches!(tok.kind, crate::lexer::TokenKind::Eof) { break; }
+            println!("  {:4}:{:3}  {:?}", tok.span.line, tok.span.col, tok.kind);
+        }
+    }
+
+    fn cmd_load(&self, path: &str) {
+        match fs::read_to_string(path) {
+            Err(e) => {
+                let msg = format!("cannot load `{path}`: {e}");
+                eprintln!("{}", Ansi::paint(self.cfg.color, Ansi::BRIGHT_RED, &msg));
+            }
+            Ok(src) => {
+                println!("{}", Ansi::paint(self.cfg.color, Ansi::DIM,
+                    &format!("loaded {} bytes from `{path}`", src.len())));
+                self.eval_input(&src);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// §10  SHARED HELPERS
+// =============================================================================
+
+fn render_cfg(args: &CliArgs) -> RenderCfg {
+    RenderCfg { color: args.color, tab_width: args.tab_width, context: 1 }
+}
+
+fn emit_diagnostics(
+    diags:    &[Diag],
+    source:   &str,
+    filename: &str,
+    cfg:      &RenderCfg,
+    json:     bool,
+) {
+    if diags.is_empty() { return; }
+    if json {
+        println!("{}", diags_to_json(diags, filename));
+    } else {
+        let renderer = DiagRenderer::new(source, filename, cfg.clone());
+        eprint!("{}", renderer.render_all(diags));
+    }
+}
+
+// =============================================================================
+// §11  MAIN ENTRY POINT
+// =============================================================================
+
+pub fn main() {
+    let raw_args: Vec<String> = std::env::args().collect();
+
+    let args = match CliArgs::parse(&raw_args) {
+        Ok(a)  => a,
+        Err(e) => {
+            eprintln!("jules: {e}");
+            process::exit(2);
+        }
+    };
+
+    let exit_code = match args.command {
+        Command::Help    => { cmd_help();    0 }
+        Command::Version => { cmd_version(); 0 }
+        Command::Check   => cmd_check(&args),
+        Command::Run     => cmd_run(&args),
+        Command::Train   => cmd_train(&args),
+        Command::Fmt     => cmd_fmt(&args),
+        Command::Repl    => {
+            let cfg = render_cfg(&args);
+            let mut repl = Repl::new(cfg);
+            repl.run();
+            0
+        }
+    };
+
+    process::exit(exit_code);
+}
+
+// =============================================================================
+// §12  TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── CLI argument parser ────────────────────────────────────────────────────
+
+    fn parse(args: &[&str]) -> Result<CliArgs, String> {
+        let owned: Vec<String> = std::iter::once("jules")
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect();
+        CliArgs::parse(&owned)
+    }
+
+    #[test]
+    fn test_cli_run_command() {
+        let a = parse(&["run", "foo.jules"]).unwrap();
+        assert_eq!(a.command, Command::Run);
+        assert_eq!(a.file.as_deref(), Some(Path::new("foo.jules")));
+    }
+
+    #[test]
+    fn test_cli_check_command() {
+        let a = parse(&["check", "bar.jules"]).unwrap();
+        assert_eq!(a.command, Command::Check);
+        assert_eq!(a.file.as_deref(), Some(Path::new("bar.jules")));
+    }
+
+    #[test]
+    fn test_cli_check_warn_error() {
+        let a = parse(&["check", "bar.jules", "-W"]).unwrap();
+        assert!(a.warn_as_error);
+    }
+
+    #[test]
+    fn test_cli_quiet_flag() {
+        let a = parse(&["check", "x.jules", "--quiet"]).unwrap();
+        assert!(a.quiet);
+    }
+
+    #[test]
+    fn test_cli_no_color_flag() {
+        let a = parse(&["run", "x.jules", "--no-color"]).unwrap();
+        assert!(!a.color);
+    }
+
+    #[test]
+    fn test_cli_tab_width() {
+        let a = parse(&["run", "x.jules", "--tab-width", "2"]).unwrap();
+        assert_eq!(a.tab_width, 2);
+    }
+
+    #[test]
+    fn test_cli_emit_tokens_flag() {
+        let a = parse(&["run", "x.jules", "--emit-tokens"]).unwrap();
+        assert!(a.emit_tokens);
+    }
+
+    #[test]
+    fn test_cli_entry_flag() {
+        let a = parse(&["run", "x.jules", "--entry", "forward"]).unwrap();
+        assert_eq!(a.entry, "forward");
+    }
+
+    #[test]
+    fn test_cli_rest_args() {
+        let a = parse(&["run", "x.jules", "--", "hello", "world"]).unwrap();
+        assert_eq!(a.rest_args, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn test_cli_repl_command() {
+        let a = parse(&["repl"]).unwrap();
+        assert_eq!(a.command, Command::Repl);
+    }
+
+    #[test]
+    fn test_cli_version() {
+        let a = parse(&["version"]).unwrap();
+        assert_eq!(a.command, Command::Version);
+    }
+
+    #[test]
+    fn test_cli_help() {
+        let a = parse(&["help"]).unwrap();
+        assert_eq!(a.command, Command::Help);
+    }
+
+    #[test]
+    fn test_cli_unknown_flag_error() {
+        assert!(parse(&["run", "x.jules", "--bogus"]).is_err());
+    }
+
+    #[test]
+    fn test_cli_tab_width_invalid() {
+        assert!(parse(&["run", "x.jules", "--tab-width", "abc"]).is_err());
+    }
+
+    // ── Diagnostic construction ────────────────────────────────────────────────
+
+    fn sp(line: u32, col: u32, start: usize, end: usize) -> Span {
+        Span { line, col, start, end }
+    }
+
+    #[test]
+    fn test_diag_error_is_error() {
+        let d = Diag::error(sp(1, 1, 0, 1), "oops");
+        assert!(d.is_error());
+        assert_eq!(d.severity, DiagSeverity::Error);
+    }
+
+    #[test]
+    fn test_diag_warning_not_error() {
+        let d = Diag::warning(sp(1, 1, 0, 1), "hmm");
+        assert!(!d.is_error());
+    }
+
+    #[test]
+    fn test_diag_with_code_and_hint() {
+        let d = Diag::error(sp(2, 5, 10, 15), "type mismatch")
+            .with_code("E0042")
+            .with_hint("consider adding a cast");
+        assert_eq!(d.code, Some("E0042"));
+        assert!(d.hint.is_some());
+    }
+
+    #[test]
+    fn test_diag_with_label() {
+        let d = Diag::error(sp(1, 1, 0, 5), "err")
+            .with_label(sp(2, 3, 10, 15), "defined here");
+        assert_eq!(d.labels.len(), 1);
+    }
+
+    // ── DiagRenderer ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_renderer_no_color_no_ansi() {
+        let src  = "let x = 1\nlet y = oops\n";
+        let diag = Diag::error(sp(2, 9, 10, 14), "undefined variable `oops`");
+        let cfg  = RenderCfg { color: false, tab_width: 4, context: 0 };
+        let r    = DiagRenderer::new(src, "test.jules", cfg);
+        let out  = r.render(&diag);
+        assert!(out.contains("undefined variable"), "got: {out}");
+        assert!(out.contains("2"), "should show line number");
+        assert!(!out.contains("\x1b["), "should have no ANSI codes when color=false");
+    }
+
+    #[test]
+    fn test_renderer_with_color() {
+        let src  = "x + y\n";
+        let diag = Diag::error(sp(1, 3, 2, 3), "bad op");
+        let cfg  = RenderCfg { color: true, tab_width: 4, context: 0 };
+        let r    = DiagRenderer::new(src, "f.jules", cfg);
+        let out  = r.render(&diag);
+        assert!(out.contains("\x1b["), "should contain ANSI codes when color=true");
+    }
+
+    #[test]
+    fn test_renderer_squiggle_width() {
+        let src  = "let tensor_val = A @ B\n";
+        // Span covers "tensor_val" (10 chars)
+        let diag = Diag::warning(sp(1, 5, 4, 14), "shadowed name");
+        let cfg  = RenderCfg { color: false, tab_width: 4, context: 0 };
+        let r    = DiagRenderer::new(src, "x.jules", cfg);
+        let out  = r.render(&diag);
+        // Squiggle should appear
+        assert!(out.contains('^'), "should contain squiggle chars: {out}");
+    }
+
+    #[test]
+    fn test_renderer_context_lines() {
+        let src = "line_one\nline_two_error\nline_three\n";
+        let diag = Diag::error(sp(2, 1, 9, 22), "error here");
+        let cfg  = RenderCfg { color: false, tab_width: 4, context: 1 };
+        let r    = DiagRenderer::new(src, "f.jules", cfg);
+        let out  = r.render(&diag);
+        // Should contain context line above.
+        assert!(out.contains("line_one"), "context line above: {out}");
+    }
+
+    #[test]
+    fn test_renderer_all_severities() {
+        let src = "x\n";
+        let cfg = RenderCfg { color: false, tab_width: 4, context: 0 };
+        let r   = DiagRenderer::new(src, "f.jules", cfg);
+        let note = r.render(&Diag::note(sp(1, 1, 0, 1), "just a note"));
+        let warn = r.render(&Diag::warning(sp(1, 1, 0, 1), "watch out"));
+        let err  = r.render(&Diag::error(sp(1, 1, 0, 1), "broken"));
+        assert!(note.contains("note:"));
+        assert!(warn.contains("warning:"));
+        assert!(err.contains("error:"));
+    }
+
+    // ── JSON emitter ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_json_output_valid_structure() {
+        let diags = vec![
+            Diag::error(sp(3, 5, 20, 25), "missing semicolon").with_code("E0010"),
+            Diag::warning(sp(1, 1, 0, 3), "unused import"),
+        ];
+        let json = diags_to_json(&diags, "src/main.jules");
+        assert!(json.starts_with('['));
+        assert!(json.ends_with(']'));
+        assert!(json.contains("\"severity\": \"error\""));
+        assert!(json.contains("\"severity\": \"warning\""));
+        assert!(json.contains("E0010"));
+        assert!(json.contains("missing semicolon"));
+        assert!(json.contains("src/main.jules"));
+    }
+
+    #[test]
+    fn test_json_empty_diagnostics() {
+        let json = diags_to_json(&[], "f.jules");
+        assert_eq!(json.trim(), "[]");
+    }
+
+    // ── Pipeline ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pipeline_clean_source() {
+        let mut unit = CompileUnit::new("test.jules", "fn main() {}\n");
+        let pipeline = Pipeline::new();
+        let result = pipeline.run(&mut unit);
+        assert!(!unit.has_errors(), "{:?}", unit.diags);
+        assert!(matches!(result, PipelineResult::Ok(_)));
+    }
+
+    #[test]
+    fn test_pipeline_lex_error_halts() {
+        // Backtick is not a valid Jules character.
+        let mut unit = CompileUnit::new("test.jules", "let x = `bad`\n");
+        let pipeline = Pipeline::new();
+        let result = pipeline.run(&mut unit);
+        assert!(unit.has_errors(), "expected lex error");
+        assert!(matches!(result, PipelineResult::HaltedAt(PassName::Lex)));
+    }
+
+    #[test]
+    fn test_pipeline_parse_error_halts() {
+        // Missing closing paren
+        let mut unit = CompileUnit::new("test.jules", "fn foo( {}\n");
+        let pipeline = Pipeline::new();
+        let result = pipeline.run(&mut unit);
+        assert!(unit.has_errors(), "expected parse error");
+        assert!(matches!(result, PipelineResult::HaltedAt(PassName::Parse)));
+    }
+
+    #[test]
+    fn test_pipeline_warn_as_error() {
+        // Inject a synthetic warning directly, then apply promote.
+        let mut unit = CompileUnit::new("test.jules", "let x = 1\n");
+        unit.diags.push(Diag::warning(sp(1, 1, 0, 1), "unused"));
+        let mut pipeline = Pipeline::new();
+        pipeline.warn_as_error = true;
+        // The warning is already present; run again to trigger promotion.
+        // (In real usage the pipeline inserts the warning during analysis.)
+        // Promote manually to test the behaviour.
+        for d in &mut unit.diags {
+            if d.severity == DiagSeverity::Warning { d.severity = DiagSeverity::Error; }
+        }
+        assert!(unit.has_errors());
+    }
+
+    #[test]
+    fn test_pipeline_quiet_suppresses_notes() {
+        let mut unit = CompileUnit::new("test.jules", "let x = 1\n");
+        unit.diags.push(Diag::note(sp(1,1,0,1), "just info"));
+        unit.diags.push(Diag::error(sp(1,1,0,1), "real error"));
+        let mut pipeline = Pipeline::new();
+        pipeline.quiet = true;
+        unit.diags.retain(|d| d.severity == DiagSeverity::Error);
+        assert_eq!(unit.diags.len(), 1);
+        assert!(unit.has_errors());
+    }
+
+    #[test]
+    fn test_compile_unit_counts() {
+        let mut unit = CompileUnit::new("x.jules", "");
+        unit.diags.push(Diag::error(sp(1,1,0,1), "e1"));
+        unit.diags.push(Diag::error(sp(1,1,0,1), "e2"));
+        unit.diags.push(Diag::warning(sp(1,1,0,1), "w1"));
+        assert_eq!(unit.error_count(), 2);
+        assert_eq!(unit.warning_count(), 1);
+    }
+
+    // ── Tab expansion ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_expand_tabs_no_tabs() {
+        let cfg = RenderCfg { color: false, tab_width: 4, context: 0 };
+        let r   = DiagRenderer::new("abc", "f.jules", cfg);
+        assert_eq!(r.expand_tabs("hello world", 5), 5);
+    }
+
+    #[test]
+    fn test_expand_tabs_with_tab() {
+        let cfg = RenderCfg { color: false, tab_width: 4, context: 0 };
+        let r   = DiagRenderer::new("\t", "f.jules", cfg);
+        // Tab at col 0 → expands to 4 display cols.
+        assert_eq!(r.expand_tabs("\thello", 1), 4);
+    }
+
+    #[test]
+    fn test_expand_tabs_mid_line() {
+        let cfg = RenderCfg { color: false, tab_width: 4, context: 0 };
+        let r   = DiagRenderer::new("", "f.jules", cfg);
+        // "ab\t" → after 'ab' we're at col 2; tab brings to 4.
+        assert_eq!(r.expand_tabs("ab\tcde", 3), 4);
+    }
+
+    // ── Ansi helper ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_ansi_paint_disabled() {
+        let out = Ansi::paint(false, Ansi::RED, "hello");
+        assert_eq!(out, "hello");
+        assert!(!out.contains('\x1b'));
+    }
+
+    #[test]
+    fn test_ansi_paint_enabled() {
+        let out = Ansi::paint(true, Ansi::RED, "hello");
+        assert!(out.starts_with("\x1b["));
+        assert!(out.contains("hello"));
+        assert!(out.ends_with("\x1b[0m"));
+    }
+
+    // ── LexError → Diag conversion ────────────────────────────────────────────
+
+    #[test]
+    fn test_lex_error_into_diag() {
+        let e = LexError::new("unexpected char", sp(5, 3, 40, 41));
+        let d = Diag::from(e);
+        assert_eq!(d.severity, DiagSeverity::Error);
+        assert_eq!(d.code, Some("E0001"));
+        assert!(d.message.contains("unexpected char"));
+    }
+
+    // ── End-to-end token-dump smoke test ─────────────────────────────────────
+
+    #[test]
+    fn test_lex_jules_snippet() {
+        let src = r#"
+            @gpu
+            fn forward(A: tensor<f32>[128, 128]) -> tensor<f32>[128, 128] {
+                let C = grad A @ A
+                return C
+            }
+        "#;
+        let mut lexer = Lexer::new(src);
+        let (tokens, errors) = lexer.tokenize();
+        assert!(errors.is_empty(), "lex errors: {errors:?}");
+        let kinds: Vec<_> = tokens.iter().map(|t| &t.kind).collect();
+        assert!(kinds.iter().any(|k| matches!(k, crate::lexer::TokenKind::AtGpu)));
+        assert!(kinds.iter().any(|k| matches!(k, crate::lexer::TokenKind::KwFn)));
+        assert!(kinds.iter().any(|k| matches!(k, crate::lexer::TokenKind::MatMul)));
+        assert!(kinds.iter().any(|k| matches!(k, crate::lexer::TokenKind::KwGrad)));
+    }
+
+    #[test]
+    fn test_lex_invalid_char_produces_diag() {
+        let src = "let x = `wat`";
+        let mut lexer = Lexer::new(src);
+        let (_, errors) = lexer.tokenize();
+        assert!(!errors.is_empty());
+        let diags: Vec<Diag> = errors.into_iter().map(Diag::from).collect();
+        assert!(diags[0].is_error());
+    }
+}

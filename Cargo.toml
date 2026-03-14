@@ -1,0 +1,11 @@
+[package]
+name = "jules"
+version = "0.1.0"
+edition = "2021"
+authors = ["jules"]
+description = "Jules programming language compiler/interpreter"
+license = "MIT"
+
+[[bin]]
+name = "jules"
+path = "main.rs"

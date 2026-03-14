@@ -1,0 +1,20 @@
+model PolicyNet {
+    input 4
+    dense 8 relu
+    output 2 softmax
+}
+
+agent Dummy {
+    perception vision 1
+    learning reinforcement, model: PolicyNet
+    behavior Test(priority: 10) {
+        if true { return }
+    }
+}
+
+train Dummy in World {
+    reward survive 1.0
+    penalty damage 0.5
+    episode { max_steps: 10, num_envs: 1 }
+    model PolicyNet
+}
