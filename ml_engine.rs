@@ -42,6 +42,13 @@ pub enum Operation {
     Transpose { axes: Vec<usize> },           // Transpose axes
 }
 
+// Simple pseudo-random based on input for deterministic initialization
+fn _as_pseudo_rand(seed: usize) -> usize {
+    let mut x = seed.wrapping_mul(2654435761);
+    x = ((x >> 16) ^ x).wrapping_mul(0x7feb352d);
+    (x >> 15) ^ x
+}
+
 #[derive(Debug, Clone)]
 pub struct Tensor {
     pub shape: Vec<usize>,
@@ -63,6 +70,34 @@ impl Tensor {
             shape,
             data: vec![1.0; numel],
         }
+    }
+
+    /// Xavier (Glorot) initialization - good for sigmoid/tanh
+    pub fn xavier(shape: Vec<usize>) -> Self {
+        let numel: usize = shape.iter().product();
+        let limit = (6.0 / (shape.get(0).copied().unwrap_or(1) + shape.get(1).copied().unwrap_or(1)) as f32).sqrt();
+        let data = (0..numel)
+            .map(|_| {
+                // Pseudo-random number between -limit and limit
+                let r = ((numel as f32 * (_as_pseudo_rand(numel) as f32)).sin() * limit.abs());
+                if (numel ^ _as_pseudo_rand(numel * 2)) & 1 == 0 { r } else { -r }
+            })
+            .collect();
+        Tensor { shape, data }
+    }
+
+    /// He initialization - good for ReLU
+    pub fn he(shape: Vec<usize>) -> Self {
+        let numel: usize = shape.iter().product();
+        let fan_in = shape.get(0).copied().unwrap_or(1) as f32;
+        let std = (2.0 / fan_in).sqrt();
+        let data = (0..numel)
+            .map(|i| {
+                let r = ((i as f32 * std * 3.14159).sin() * std);
+                r.max(-3.0 * std).min(3.0 * std)
+            })
+            .collect();
+        Tensor { shape, data }
     }
 
     pub fn numel(&self) -> usize {
@@ -207,11 +242,68 @@ impl Tensor {
         upstream_grad.matmul(&b_t)
     }
 
+    /// Compute gradient for matmul: dL/dB = A^T @ dL/dC
+    pub fn matmul_grad_b(&self, a: &Tensor, upstream_grad: &Tensor) -> Tensor {
+        let a_t_shape = vec![a.shape[1], a.shape[0]];
+        let a_t_data: Vec<f32> = (0..a.shape[1])
+            .flat_map(|j| (0..a.shape[0])
+                .map(move |i| a.data[i * a.shape[1] + j]))
+            .collect();
+
+        let a_t = Tensor {
+            shape: a_t_shape,
+            data: a_t_data,
+        };
+
+        a_t.matmul(upstream_grad)
+    }
+
     /// Clone the gradient structure
     pub fn clone_shape(&self) -> Tensor {
         Tensor {
             shape: self.shape.clone(),
             data: self.data.clone(),
+        }
+    }
+
+    /// Clip gradients by value to prevent exploding gradients
+    pub fn clip_by_value(&self, min: f32, max: f32) -> Tensor {
+        Tensor {
+            shape: self.shape.clone(),
+            data: self.data.iter()
+                .map(|x| x.max(min).min(max))
+                .collect(),
+        }
+    }
+
+    /// Clip gradients by global norm
+    pub fn clip_by_norm(&self, max_norm: f32) -> Tensor {
+        let norm = self.data.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm <= max_norm || norm < 1e-8 {
+            self.clone_shape()
+        } else {
+            Tensor {
+                shape: self.shape.clone(),
+                data: self.data.iter()
+                    .map(|x| x * (max_norm / norm))
+                    .collect(),
+            }
+        }
+    }
+
+    /// Normalize tensor to zero mean and unit variance
+    pub fn normalize(&self) -> Tensor {
+        let mean = self.mean();
+        let variance = self.data.iter()
+            .map(|x| (x - mean).powi(2))
+            .sum::<f32>() / self.numel().max(1) as f32;
+        let std = variance.sqrt() + 1e-8;
+
+        Tensor {
+            shape: self.shape.clone(),
+            data: self.data.iter()
+                .map(|x| (x - mean) / std)
+                .collect(),
         }
     }
 }
@@ -339,7 +431,7 @@ impl ComputationGraph {
                             let b_val = &self.nodes.get(&b_id).unwrap().value.clone();
 
                             let grad_a = a_val.matmul_grad_a(&upstream_grad, b_val);
-                            let grad_b = a_val.matmul_grad_a(&upstream_grad, b_val);
+                            let grad_b = a_val.matmul_grad_b(a_val, &upstream_grad);
 
                             if let Some(a) = self.nodes.get_mut(&a_id) {
                                 a.gradient = Some(match &a.gradient {
@@ -478,13 +570,15 @@ impl Optimizer {
             .entry(0)
             .or_insert_with(|| vec![0.0; weights.len()]);
 
-        for (w, g, m) in itertools::zip_longest(weights, grads, momentum_vec) {
-            if let (itertools::Either::Left(w), itertools::Either::Left(g)) = (&w, &g) {
-                if let itertools::Either::Left(m) = &m {
-                    *m = momentum * *m - lr * *g;
-                    **w += **m;
-                }
-            }
+        // Ensure momentum buffer matches weight size
+        if momentum_vec.len() != weights.len() {
+            momentum_vec.resize(weights.len(), 0.0);
+        }
+
+        for i in 0..weights.len() {
+            let grad = if i < grads.len() { grads[i] } else { 0.0 };
+            momentum_vec[i] = momentum * momentum_vec[i] - lr * grad;
+            weights[i] += momentum_vec[i];
         }
     }
 
@@ -613,5 +707,139 @@ impl LearningRateScheduler {
     }
 }
 
-// Note: itertools zip_longest would need to be implemented manually or use std zip
-// For now, using simple indexing approach
+// Implemented optimizer suite without external dependencies
+// SGD, Adam, AdamW, RMSprop all use simple indexing patterns
+
+// =========================================================================
+// Loss Functions Module - Improved numerical stability
+// =========================================================================
+
+pub struct LossFunctions;
+
+impl LossFunctions {
+    /// Mean Squared Error loss with numerical stability
+    pub fn mse(predictions: &Tensor, targets: &Tensor) -> f32 {
+        assert_eq!(predictions.shape, targets.shape, "Shape mismatch in MSE");
+        predictions.data.iter()
+            .zip(&targets.data)
+            .map(|(p, t)| {
+                let diff = p - t;
+                diff * diff
+            })
+            .sum::<f32>() / predictions.numel().max(1) as f32
+    }
+
+    /// Cross-Entropy loss with numerical stability (log-sum-exp trick)
+    pub fn cross_entropy(logits: &Tensor, targets: &Tensor) -> f32 {
+        assert_eq!(logits.shape, targets.shape, "Shape mismatch in Cross-Entropy");
+
+        // Numerically stable cross-entropy
+        let max_logit = logits.data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let exp_logits: Vec<f32> = logits.data.iter()
+            .map(|x| (x - max_logit).exp())
+            .collect();
+        let sum_exp: f32 = exp_logits.iter().sum();
+
+        logits.data.iter()
+            .zip(&targets.data)
+            .enumerate()
+            .map(|(i, (logit, target))| {
+                let prob = exp_logits[i] / sum_exp;
+                -target * (prob.max(1e-8).ln())
+            })
+            .sum::<f32>() / logits.numel().max(1) as f32
+    }
+
+    /// Binary Cross-Entropy with numerical stability
+    pub fn binary_cross_entropy(predictions: &Tensor, targets: &Tensor) -> f32 {
+        assert_eq!(predictions.shape, targets.shape, "Shape mismatch in BCE");
+        predictions.data.iter()
+            .zip(&targets.data)
+            .map(|(p, t)| {
+                let p = p.max(1e-8).min(1.0 - 1e-8);
+                -t * p.ln() - (1.0 - t) * (1.0 - p).ln()
+            })
+            .sum::<f32>() / predictions.numel().max(1) as f32
+    }
+
+    /// Compute MSE gradient
+    pub fn mse_gradient(predictions: &Tensor, targets: &Tensor) -> Tensor {
+        assert_eq!(predictions.shape, targets.shape);
+        Tensor {
+            shape: predictions.shape.clone(),
+            data: predictions.data.iter()
+                .zip(&targets.data)
+                .map(|(p, t)| 2.0 * (p - t) / predictions.numel().max(1) as f32)
+                .collect(),
+        }
+    }
+
+    /// Compute gradient of predictions for softmax cross-entropy
+    pub fn softmax_cross_entropy_gradient(logits: &Tensor, targets: &Tensor) -> Tensor {
+        assert_eq!(logits.shape, targets.shape);
+
+        // Softmax probabilities with stability
+        let max_logit = logits.data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let exp_logits: Vec<f32> = logits.data.iter()
+            .map(|x| (x - max_logit).exp())
+            .collect();
+        let sum_exp: f32 = exp_logits.iter().sum();
+
+        Tensor {
+            shape: logits.shape.clone(),
+            data: exp_logits.iter()
+                .zip(&targets.data)
+                .map(|(prob_unnorm, target)| {
+                    let prob = prob_unnorm / sum_exp;
+                    (prob - target) / logits.numel().max(1) as f32
+                })
+                .collect(),
+        }
+    }
+}
+
+// =========================================================================
+// Regularization Utilities
+// =========================================================================
+
+pub struct Regularization;
+
+impl Regularization {
+    /// L2 regularization penalty
+    pub fn l2_penalty(weights: &Tensor, lambda: f32) -> f32 {
+        lambda * weights.data.iter()
+            .map(|w| w * w)
+            .sum::<f32>()
+    }
+
+    /// L1 regularization penalty
+    pub fn l1_penalty(weights: &Tensor, lambda: f32) -> f32 {
+        lambda * weights.data.iter()
+            .map(|w| w.abs())
+            .sum::<f32>()
+    }
+
+    /// Compute L2 gradient
+    pub fn l2_gradient(weights: &Tensor, lambda: f32) -> Tensor {
+        Tensor {
+            shape: weights.shape.clone(),
+            data: weights.data.iter()
+                .map(|w| 2.0 * lambda * w)
+                .collect(),
+        }
+    }
+
+    /// Compute L1 gradient (subgradient)
+    pub fn l1_gradient(weights: &Tensor, lambda: f32) -> Tensor {
+        Tensor {
+            shape: weights.shape.clone(),
+            data: weights.data.iter()
+                .map(|w| lambda * w.signum())
+                .collect(),
+        }
+    }
+}
+
+// Implemented optimizer suite without external dependencies
+// SGD, Adam, AdamW, RMSprop all use simple indexing patterns
+
