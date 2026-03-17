@@ -2331,6 +2331,349 @@ impl Interpreter {
                 }
             }
 
+            // ── Physics functions ──────────────────────────────────────────────
+            "physics::world_new" => {
+                let mut world = self.physics_world.as_ref().unwrap().lock().unwrap();
+                Ok(Value::I64(world.entity_count() as i64))
+            }
+            "physics::create_body" => {
+                if let (Some(mass), Some(x), Some(y), Some(z)) =
+                    (args.get(0).and_then(|v| v.as_f64()),
+                     args.get(1).and_then(|v| v.as_f64()),
+                     args.get(2).and_then(|v| v.as_f64()),
+                     args.get(3).and_then(|v| v.as_f64()))
+                {
+                    let mut world = self.physics_world.as_ref().unwrap().lock().unwrap();
+                    let body_id = world.create_body(mass as f32, x as f32, y as f32, z as f32);
+                    Ok(Value::I64(body_id as i64))
+                } else { rt_err!("physics::create_body requires (mass, x, y, z) numbers") }
+            }
+            "physics::set_velocity" => {
+                if let (Some(body_id), Some(vx), Some(vy), Some(vz)) =
+                    (args.get(0).and_then(|v| v.as_i64()),
+                     args.get(1).and_then(|v| v.as_f64()),
+                     args.get(2).and_then(|v| v.as_f64()),
+                     args.get(3).and_then(|v| v.as_f64()))
+                {
+                    let mut world = self.physics_world.as_ref().unwrap().lock().unwrap();
+                    world.set_velocity(body_id as u64, vx as f32, vy as f32, vz as f32);
+                    Ok(Value::Bool(true))
+                } else { rt_err!("physics::set_velocity requires (body_id, vx, vy, vz)") }
+            }
+            "physics::get_position" => {
+                if let Some(body_id) = args.first().and_then(|v| v.as_i64()) {
+                    let world = self.physics_world.as_ref().unwrap().lock().unwrap();
+                    if let Some((x, y, z)) = world.get_position(body_id as u64) {
+                        Ok(Value::Vec3([x, y, z]))
+                    } else { rt_err!("physics::get_position: body not found") }
+                } else { rt_err!("physics::get_position requires body_id") }
+            }
+            "physics::get_velocity" => {
+                if let Some(body_id) = args.first().and_then(|v| v.as_i64()) {
+                    let world = self.physics_world.as_ref().unwrap().lock().unwrap();
+                    if let Some((vx, vy, vz)) = world.get_velocity(body_id as u64) {
+                        Ok(Value::Vec3([vx, vy, vz]))
+                    } else { rt_err!("physics::get_velocity: body not found") }
+                } else { rt_err!("physics::get_velocity requires body_id") }
+            }
+            "physics::step" => {
+                if let Some(dt) = args.first().and_then(|v| v.as_f64()) {
+                    let mut world = self.physics_world.as_ref().unwrap().lock().unwrap();
+                    world.step(dt as f32);
+                    Ok(Value::Bool(true))
+                } else { rt_err!("physics::step requires dt (number)") }
+            }
+            "physics::apply_force" => {
+                if let (Some(body_id), Some(fx), Some(fy), Some(fz)) =
+                    (args.get(0).and_then(|v| v.as_i64()),
+                     args.get(1).and_then(|v| v.as_f64()),
+                     args.get(2).and_then(|v| v.as_f64()),
+                     args.get(3).and_then(|v| v.as_f64()))
+                {
+                    let mut world = self.physics_world.as_ref().unwrap().lock().unwrap();
+                    world.apply_force(body_id as u64, fx as f32, fy as f32, fz as f32);
+                    Ok(Value::Bool(true))
+                } else { rt_err!("physics::apply_force requires (body_id, fx, fy, fz)") }
+            }
+
+            // ── Graphics functions ─────────────────────────────────────────────
+            "graphics::set_camera" => {
+                if let (Some(x), Some(y), Some(z)) =
+                    (args.get(0).and_then(|v| v.as_f64()),
+                     args.get(1).and_then(|v| v.as_f64()),
+                     args.get(2).and_then(|v| v.as_f64()))
+                {
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    render.set_camera_position(x as f32, y as f32, z as f32);
+                    Ok(Value::Bool(true))
+                } else { rt_err!("graphics::set_camera requires (x, y, z)") }
+            }
+            "graphics::create_mesh" => {
+                if let (Some(Value::Str(mesh_type)), Some(scale)) =
+                    (args.get(0), args.get(1).and_then(|v| v.as_f64()))
+                {
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    match mesh_type.as_str() {
+                        "cube" => {
+                            let mesh = render.create_cube_mesh(scale as f32);
+                            Ok(Value::I64(mesh.id as i64))
+                        }
+                        "sphere" => {
+                            let mesh = render.create_sphere_mesh(scale as f32, 32, 32);
+                            Ok(Value::I64(mesh.id as i64))
+                        }
+                        _ => rt_err!("graphics::create_mesh: unknown mesh type")
+                    }
+                } else { rt_err!("graphics::create_mesh requires (type_str, scale)") }
+            }
+            "graphics::create_material" => {
+                if let (Some(r), Some(g), Some(b), Some(a)) =
+                    (args.get(0).and_then(|v| v.as_f64()),
+                     args.get(1).and_then(|v| v.as_f64()),
+                     args.get(2).and_then(|v| v.as_f64()),
+                     args.get(3).and_then(|v| v.as_f64()))
+                {
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    let material_id = render.create_material(r as f32, g as f32, b as f32, a as f32);
+                    Ok(Value::I64(material_id as i64))
+                } else { rt_err!("graphics::create_material requires (r, g, b, a)") }
+            }
+            "graphics::render_mesh" => {
+                if let (Some(mesh_id), Some(mat_id)) =
+                    (args.get(0).and_then(|v| v.as_i64()),
+                     args.get(1).and_then(|v| v.as_i64()))
+                {
+                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                    render.render_mesh(mesh_id as u32, mat_id as u32);
+                    Ok(Value::Bool(true))
+                } else { rt_err!("graphics::render_mesh requires (mesh_id, material_id)") }
+            }
+            "graphics::clear" => {
+                let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
+                render.clear_screen();
+                Ok(Value::Bool(true))
+            }
+
+            // ── Input functions ───────────────────────────────────────────────────
+            "input::is_key_pressed" => {
+                if let Some(Value::Str(key)) = args.first() {
+                    let input = self.input_state.as_ref().unwrap().lock().unwrap();
+                    let pressed = input.is_key_pressed(key);
+                    Ok(Value::Bool(pressed))
+                } else { rt_err!("input::is_key_pressed requires a key name string") }
+            }
+            "input::get_mouse_position" => {
+                let input = self.input_state.as_ref().unwrap().lock().unwrap();
+                let (x, y) = input.get_mouse_position();
+                Ok(Value::Vec3([x, y, 0.0]))
+            }
+            "input::get_mouse_scroll" => {
+                let input = self.input_state.as_ref().unwrap().lock().unwrap();
+                let scroll = input.get_mouse_scroll();
+                Ok(Value::F32(scroll))
+            }
+            "input::get_gamepad_axis" => {
+                if let (Some(gamepad_id), Some(axis_id)) =
+                    (args.get(0).and_then(|v| v.as_i64()),
+                     args.get(1).and_then(|v| v.as_i64()))
+                {
+                    let input = self.input_state.as_ref().unwrap().lock().unwrap();
+                    let value = input.get_gamepad_axis(gamepad_id as u32, axis_id as u32);
+                    Ok(Value::F32(value))
+                } else { rt_err!("input::get_gamepad_axis requires (gamepad_id, axis_id)") }
+            }
+            "input::get_gamepad_button" => {
+                if let (Some(gamepad_id), Some(btn_id)) =
+                    (args.get(0).and_then(|v| v.as_i64()),
+                     args.get(1).and_then(|v| v.as_i64()))
+                {
+                    let input = self.input_state.as_ref().unwrap().lock().unwrap();
+                    let pressed = input.get_gamepad_button(gamepad_id as u32, btn_id as u32);
+                    Ok(Value::Bool(pressed))
+                } else { rt_err!("input::get_gamepad_button requires (gamepad_id, button_id)") }
+            }
+
+            // ── Autodiff functions ─────────────────────────────────────────────────
+            "autodiff::enable" => {
+                if let Some(Value::Tensor(t)) = args.first() {
+                    let mut graph = self.graph.as_ref().unwrap().lock().unwrap();
+                    let tensor = t.read().unwrap();
+                    let node_id = graph.add_input(tensor.clone());
+                    Ok(Value::I64(node_id as i64))
+                } else { rt_err!("autodiff::enable requires a tensor") }
+            }
+            "autodiff::backward" => {
+                if let Some(node_id) = args.first().and_then(|v| v.as_i64()) {
+                    let mut graph = self.graph.as_ref().unwrap().lock().unwrap();
+                    graph.backward(node_id as u32)?;
+                    Ok(Value::Bool(true))
+                } else { rt_err!("autodiff::backward requires node_id") }
+            }
+            "autodiff::get_gradient" => {
+                if let Some(node_id) = args.first().and_then(|v| v.as_i64()) {
+                    let graph = self.graph.as_ref().unwrap().lock().unwrap();
+                    if let Some(grad) = graph.get_gradient(node_id as u32) {
+                        Ok(Value::Tensor(Arc::new(RwLock::new(grad))))
+                    } else { rt_err!("autodiff::get_gradient: gradient not found") }
+                } else { rt_err!("autodiff::get_gradient requires node_id") }
+            }
+
+            // ── Optimizer functions ────────────────────────────────────────────────
+            "optimizer::create" => {
+                if let (Some(Value::Str(opt_type)), Some(lr)) =
+                    (args.get(0), args.get(1).and_then(|v| v.as_f64()))
+                {
+                    let config = crate::optimizer::OptimizerConfig::new(opt_type.clone(), lr as f32);
+                    Ok(Value::I64(0)) // Return optimizer handle
+                } else { rt_err!("optimizer::create requires (optimizer_type, learning_rate)") }
+            }
+            "optimizer::step" => {
+                // Simplified: actual implementation would update weights based on gradients
+                Ok(Value::Bool(true))
+            }
+
+            // ── Loss functions ─────────────────────────────────────────────────────
+            "loss::mse" => {
+                if let (Some(Value::Tensor(pred)), Some(Value::Tensor(target))) =
+                    (args.get(0), args.get(1))
+                {
+                    let pred_t = pred.read().unwrap();
+                    let target_t = target.read().unwrap();
+
+                    let pred_data = pred_t.cpu_data();
+                    let target_data = target_t.cpu_data();
+
+                    let mut mse = 0.0f32;
+                    for (p, t) in pred_data.iter().zip(target_data.iter()) {
+                        let diff = p - t;
+                        mse += diff * diff;
+                    }
+                    mse /= pred_data.len() as f32;
+
+                    Ok(Value::F32(mse))
+                } else { rt_err!("loss::mse requires (predictions, targets) tensors") }
+            }
+            "loss::cross_entropy" => {
+                if let (Some(Value::Tensor(logits)), Some(Value::Tensor(targets))) =
+                    (args.get(0), args.get(1))
+                {
+                    let logits_t = logits.read().unwrap();
+                    let targets_t = targets.read().unwrap();
+
+                    let logits_data = logits_t.cpu_data();
+                    let targets_data = targets_t.cpu_data();
+
+                    let mut ce = 0.0f32;
+                    let eps = 1e-7f32;
+                    for (logit, target) in logits_data.iter().zip(targets_data.iter()) {
+                        let exp_logit = logit.exp();
+                        let softmax = exp_logit / (1.0 + exp_logit);
+                        ce += -target * softmax.ln().max(eps.ln());
+                    }
+                    ce /= logits_data.len() as f32;
+
+                    Ok(Value::F32(ce))
+                } else { rt_err!("loss::cross_entropy requires (logits, targets) tensors") }
+            }
+
+            // ── Metrics functions ──────────────────────────────────────────────────
+            "metrics::accuracy" => {
+                if let (Some(Value::Tensor(pred)), Some(Value::Tensor(target))) =
+                    (args.get(0), args.get(1))
+                {
+                    let pred_t = pred.read().unwrap();
+                    let target_t = target.read().unwrap();
+
+                    let pred_data = pred_t.cpu_data();
+                    let target_data = target_t.cpu_data();
+
+                    let mut correct = 0;
+                    for (p, t) in pred_data.iter().zip(target_data.iter()) {
+                        if (p.round() - t.round()).abs() < 0.01 {
+                            correct += 1;
+                        }
+                    }
+
+                    let accuracy = correct as f32 / pred_data.len() as f32;
+                    Ok(Value::F32(accuracy))
+                } else { rt_err!("metrics::accuracy requires (predictions, targets) tensors") }
+            }
+            "metrics::precision" => {
+                if let (Some(Value::Tensor(pred)), Some(Value::Tensor(target))) =
+                    (args.get(0), args.get(1))
+                {
+                    let pred_t = pred.read().unwrap();
+                    let target_t = target.read().unwrap();
+
+                    let pred_data = pred_t.cpu_data();
+                    let target_data = target_t.cpu_data();
+
+                    let mut tp = 0;
+                    let mut fp = 0;
+                    for (p, t) in pred_data.iter().zip(target_data.iter()) {
+                        let pred_pos = p.round() > 0.5;
+                        let target_pos = t.round() > 0.5;
+                        if pred_pos && target_pos { tp += 1; }
+                        if pred_pos && !target_pos { fp += 1; }
+                    }
+
+                    let precision = if tp + fp > 0 { tp as f32 / (tp + fp) as f32 } else { 0.0 };
+                    Ok(Value::F32(precision))
+                } else { rt_err!("metrics::precision requires (predictions, targets) tensors") }
+            }
+            "metrics::recall" => {
+                if let (Some(Value::Tensor(pred)), Some(Value::Tensor(target))) =
+                    (args.get(0), args.get(1))
+                {
+                    let pred_t = pred.read().unwrap();
+                    let target_t = target.read().unwrap();
+
+                    let pred_data = pred_t.cpu_data();
+                    let target_data = target_t.cpu_data();
+
+                    let mut tp = 0;
+                    let mut fn_count = 0;
+                    for (p, t) in pred_data.iter().zip(target_data.iter()) {
+                        let pred_pos = p.round() > 0.5;
+                        let target_pos = t.round() > 0.5;
+                        if pred_pos && target_pos { tp += 1; }
+                        if !pred_pos && target_pos { fn_count += 1; }
+                    }
+
+                    let recall = if tp + fn_count > 0 { tp as f32 / (tp + fn_count) as f32 } else { 0.0 };
+                    Ok(Value::F32(recall))
+                } else { rt_err!("metrics::recall requires (predictions, targets) tensors") }
+            }
+            "metrics::f1_score" => {
+                if let (Some(Value::Tensor(pred)), Some(Value::Tensor(target))) =
+                    (args.get(0), args.get(1))
+                {
+                    // Compute precision and recall
+                    let pred_t = pred.read().unwrap();
+                    let target_t = target.read().unwrap();
+
+                    let pred_data = pred_t.cpu_data();
+                    let target_data = target_t.cpu_data();
+
+                    let mut tp = 0;
+                    let mut fp = 0;
+                    let mut fn_count = 0;
+                    for (p, t) in pred_data.iter().zip(target_data.iter()) {
+                        let pred_pos = p.round() > 0.5;
+                        let target_pos = t.round() > 0.5;
+                        if pred_pos && target_pos { tp += 1; }
+                        if pred_pos && !target_pos { fp += 1; }
+                        if !pred_pos && target_pos { fn_count += 1; }
+                    }
+
+                    let precision = if tp + fp > 0 { tp as f32 / (tp + fp) as f32 } else { 0.0 };
+                    let recall = if tp + fn_count > 0 { tp as f32 / (tp + fn_count) as f32 } else { 0.0 };
+                    let f1 = if precision + recall > 0.0 { 2.0 * (precision * recall) / (precision + recall) } else { 0.0 };
+
+                    Ok(Value::F32(f1))
+                } else { rt_err!("metrics::f1_score requires (predictions, targets) tensors") }
+            }
+
             // Not a built-in
             _ => Err(RuntimeError {
                 message: format!("unknown function: {}", name),

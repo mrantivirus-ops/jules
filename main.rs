@@ -1,27 +1,3 @@
-// =============================================================================
-// jules/src/main.rs
-//
-// End-to-end language pipeline for Jules.
-//
-// ┌─────────────────────────────────────────────────────────────────────────┐
-// │  Commands                                                               │
-// │    jules run   <file.jules> [-- arg…]   Run a Jules source file            │
-// │    jules check <file.jules>             Type-check + sema, no execution    │
-// │    jules fmt   <file.jules>             Pretty-print (echo tokens / AST)   │
-// │    jules repl                        Interactive REPL / playground       │
-// │    jules train <file.jules>             Execute all train blocks            │
-// │                                                                         │
-// │  Flags                                                                  │
-// │    --no-color          Disable ANSI colour in diagnostics               │
-// │    --json-diag         Emit diagnostics as JSON (for editors / LSP)     │
-// │    --emit-ast          Dump the parsed AST to stdout and exit           │
-// │    --emit-tokens       Dump the token stream and exit                   │
-// │    --warn-error / -W   Treat warnings as errors                         │
-// │    --quiet / -q        Suppress notes and warnings                      │
-// │    --tab-width <N>     Tab-stop width used in squiggle rendering (def 4)│
-// └─────────────────────────────────────────────────────────────────────────┘
-// =============================================================================
-
 #![allow(dead_code, unused_variables, unused_imports)]
 
 // Module declarations for the Jules compiler/interpreter.
@@ -35,6 +11,8 @@ mod interp;
 mod game_systems;
 mod ml_engine;
 mod optimizer;
+mod ffi;
+mod gpu_backend;
 
 use std::fmt::Write as FmtWrite;
 use std::fs;

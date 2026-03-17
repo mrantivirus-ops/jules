@@ -3,9 +3,27 @@ name = "jules"
 version = "0.1.0"
 edition = "2021"
 authors = ["jules"]
-description = "Jules programming language compiler/interpreter"
+description = "Jules programming language compiler/interpreter with game dev, ML, and FFI support"
 license = "MIT"
+
+[lib]
+name = "jules"
+path = "interp.rs"
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "jules"
 path = "main.rs"
+
+[dependencies]
+pyo3 = { version = "0.21", features = ["extension-module"], optional = true }
+numpy = { version = "0.21", optional = true }
+libc = "0.2"
+lazy_static = "1.4"
+parking_lot = "0.12"
+
+[features]
+default = ["ffi-c"]
+python = ["pyo3", "numpy"]
+ffi-c = []
+full = ["python", "ffi-c"]

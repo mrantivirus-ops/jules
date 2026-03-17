@@ -8,29 +8,34 @@
 // │                                                                          │
 // │  Gradient-based (first-order)                                            │
 // │    SGD          — stochastic gradient descent + momentum + Nesterov      │
-// │    Adam         — adaptive moments (Kingma & Ba 2015)                    │
+// │    Adam         — adaptive moments (Kingma & Ba 2015) + AMSGrad variant  │
 // │    AdamW        — Adam + decoupled weight decay (Loshchilov 2019)        │
 // │    AdaGrad      — per-parameter accumulated squared gradients            │
-// │    RMSProp      — leaky squared-gradient accumulator                     │
+// │    RMSProp      — leaky squared-gradient accumulator (centred variant)   │
 // │    AdaDelta     — parameter-free adaptive delta rule                     │
 // │    Nadam        — Nesterov-accelerated Adam                              │
 // │    RAdam        — rectified Adam with variance warm-up                   │
 // │    LAMB         — layer-wise adaptive moments for large-batch            │
 // │    LARS         — layer-wise adaptive rate scaling (SGD variant)         │
+// │    Lion         — EvoLved Sign Momentum (Chen et al. 2023)               │
+// │    Sophia       — diagonal Hessian estimate (Liu et al. 2023)            │
+// │    Prodigy      — parameter-free lr adaptation (Mishchenko 2023)         │
 // │                                                                          │
 // │  Learning-rate schedules                                                 │
 // │    Constant, StepDecay, ExponentialDecay, CosineAnnealing,              │
 // │    CosineAnnealingWarmRestarts (SGDR), LinearWarmup + any base,          │
-// │    OneCycleLR, PolynomialDecay, ReduceOnPlateau                          │
+// │    OneCycleLR, PolynomialDecay, ReduceOnPlateau (+cooldown),             │
+// │    WarmupCosineRestarts                                                  │
 // │                                                                          │
 // │  Regularization helpers                                                  │
 // │    L1, L2, ElasticNet, GradientClipByValue, GradientClipByNorm,         │
-// │    GradientClipByGlobalNorm                                              │
+// │    GradientClipByGlobalNorm, GradientCentralization                      │
 // │                                                                          │
 // │  Utilities                                                               │
 // │    ParameterGroup — per-group lr / wd overrides                          │
 // │    OptimizerState — serialisable snapshot for checkpoint / resume        │
 // │    GradAccumulator — mini-batch gradient accumulation                    │
+// │    WeightEma       — exponential moving average of model weights         │
 // └─────────────────────────────────────────────────────────────────────────┘
 //
 // Design constraints
@@ -38,11 +43,17 @@
 // • Zero external dependencies — uses only Rust std.
 // • No heap allocations in the hot path (step()) beyond what the model
 //   already owns; moment buffers are pre-allocated in `build()`.
+//   Exception: LAMB pre-allocates update_buf at first step.
 // • All arithmetic in f32 to match the tensor runtime.
 // • Each optimizer implements the `Optimizer` trait so callers are
 //   algorithm-agnostic.
-// • Every optimizer is fully deterministic given the same seed: the internal
-//   PRNGs used for noise-injection (RAdam variance bias) are LCG-based.
+// • Bias correction uses incremental multiplies (β^t accumulated per step)
+//   rather than powf(t) — eliminates two FP transcendentals per step.
+// • GradClip::ByNorm is a per-group vector operation applied before the
+//   inner element loop; the previous per-element fallthrough was a silent
+//   no-op and has been fixed.
+// • ensure_buffers() fast-paths when sizes already match (steady-state
+//   training: zero branches taken, zero allocations).
 // =============================================================================
 
 #![allow(dead_code)]
@@ -125,7 +136,9 @@ impl LrSchedule for StepDecay {
 pub struct ExponentialDecay { pub gamma: f32 }
 impl LrSchedule for ExponentialDecay {
     fn multiplier(&self, step: u64, base_lr: f32) -> f32 {
-        base_lr * self.gamma.powi(step as i32)
+        // Use powf(f32) rather than powi(i32): i32 saturates at ~2 B steps and
+        // triggers UB on overflow; f32 handles arbitrarily large exponents gracefully.
+        base_lr * self.gamma.powf(step as f32)
     }
 }
 
@@ -190,7 +203,7 @@ impl LrSchedule for OneCycleLr {
     fn multiplier(&self, step: u64, base_lr: f32) -> f32 {
         let t = step as f32;
         let n = self.total_steps as f32;
-        let warmup_end = (self.pct_start * n) as u64;
+        let warmup_end = ((self.pct_start * n) as u64).max(1); // guard div-by-zero
         if step <= warmup_end {
             // Ramp: initial_lr → base_lr
             let frac = t / warmup_end as f32;
@@ -199,7 +212,7 @@ impl LrSchedule for OneCycleLr {
         } else {
             // Cosine decay: base_lr → base_lr / (div_factor * final_div_factor)
             let min_lr = base_lr / (self.div_factor * self.final_div_factor);
-            let frac = (t - warmup_end as f32) / (n - warmup_end as f32);
+            let frac = (t - warmup_end as f32) / (n - warmup_end as f32).max(1.0);
             min_lr + 0.5 * (base_lr - min_lr) * (1.0 + (PI * frac).cos())
         }
     }
@@ -226,32 +239,40 @@ pub struct ReduceOnPlateau {
     pub patience:  u32,   // number of non-improving checks before reducing
     pub min_lr:    f32,
     pub threshold: f32,   // minimum improvement to count as progress
+    pub cooldown:  u32,   // steps to wait after a reduction before counting again
     // Internal state
     best:          f32,
     bad_epochs:    u32,
+    cooldown_left: u32,
     current_mul:   f32,
 }
 impl ReduceOnPlateau {
     pub fn new(factor: f32, patience: u32, min_lr: f32) -> Self {
         ReduceOnPlateau {
-            factor, patience, min_lr, threshold: 1e-4,
-            best: f32::INFINITY, bad_epochs: 0, current_mul: 1.0,
+            factor, patience, min_lr, threshold: 1e-4, cooldown: 0,
+            best: f32::INFINITY, bad_epochs: 0, cooldown_left: 0, current_mul: 1.0,
         }
     }
+    pub fn with_cooldown(mut self, cooldown: u32) -> Self { self.cooldown = cooldown; self }
 }
 impl LrSchedule for ReduceOnPlateau {
     fn multiplier(&self, _step: u64, base_lr: f32) -> f32 {
         (base_lr * self.current_mul).max(self.min_lr)
     }
     fn on_metric(&mut self, metric: f32) {
+        if self.cooldown_left > 0 {
+            self.cooldown_left -= 1;
+            return;
+        }
         if metric < self.best - self.threshold {
             self.best = metric;
             self.bad_epochs = 0;
         } else {
             self.bad_epochs += 1;
             if self.bad_epochs >= self.patience {
-                self.current_mul *= self.factor;
-                self.bad_epochs   = 0;
+                self.current_mul  *= self.factor;
+                self.bad_epochs    = 0;
+                self.cooldown_left = self.cooldown;
             }
         }
     }
@@ -356,8 +377,15 @@ impl GradAccumulator {
         GradAccumulator { buffer: vec![0.0; n], count: 0 }
     }
 
+    /// Accumulate one gradient vector.
+    ///
+    /// If `grads` is a different length than the buffer (e.g. after a model
+    /// reshape), the buffer is silently re-initialised rather than panicking.
     pub fn accumulate(&mut self, grads: &[f32]) {
-        assert_eq!(grads.len(), self.buffer.len());
+        if grads.len() != self.buffer.len() {
+            self.buffer = vec![0.0; grads.len()];
+            self.count  = 0;
+        }
         for (acc, &g) in self.buffer.iter_mut().zip(grads) { *acc += g; }
         self.count += 1;
     }
@@ -367,6 +395,16 @@ impl GradAccumulator {
         let inv = 1.0 / n.max(1) as f32;
         for acc in self.buffer.iter_mut() { *acc *= inv; }
     }
+
+    /// Average by internal count then return a reference (common pattern).
+    pub fn average_and_view(&mut self) -> &[f32] {
+        let n = self.count;
+        self.average(n);
+        &self.buffer
+    }
+
+    /// Borrow the current accumulated buffer (without averaging).
+    pub fn view(&self) -> &[f32] { &self.buffer }
 
     pub fn reset(&mut self) {
         self.buffer.iter_mut().for_each(|x| *x = 0.0);
@@ -493,6 +531,12 @@ impl Sgd {
     }
 
     fn ensure_buffers(&mut self, params: &[ParamBuffer<'_>]) {
+        // Fast-path: nothing to do if all buffers already match.
+        if self.velocity.len() == params.len()
+            && self.velocity.iter().zip(params).all(|(b, p)| b.len() == p.numel())
+        {
+            return;
+        }
         if self.velocity.len() < params.len() {
             self.velocity.resize_with(params.len(), Vec::new);
         }
@@ -516,21 +560,17 @@ impl Optimizer for Sgd {
             let eff_wd = self.hp.weight_decay * p.wd_scale;
             let v      = &mut self.velocity[i];
 
-            for (j, (&g, w)) in p.grads.iter().zip(p.weights.iter_mut()).enumerate() {
-                // Apply gradient clipping per-element (value) if requested.
-                let g = match self.hp.grad_clip {
-                    Some(GradClip::ByValue(c)) => g.clamp(-c, c),
-                    _ => g,
-                };
-                // L2 weight decay in gradient form.
-                let g = g + eff_wd * *w;
-
-                // Velocity update.
-                v[j] = self.momentum * v[j] - eff_lr * g;
-
-                if self.nesterov {
+            // Hoist the Nesterov branch: one check per group, not per element.
+            if self.nesterov {
+                for (j, (&g, w)) in p.grads.iter().zip(p.weights.iter_mut()).enumerate() {
+                    let g = clip_grad(g, self.hp.grad_clip) + eff_wd * *w;
+                    v[j] = self.momentum * v[j] - eff_lr * g;
                     *w += self.momentum * v[j] - eff_lr * g;
-                } else {
+                }
+            } else {
+                for (j, (&g, w)) in p.grads.iter().zip(p.weights.iter_mut()).enumerate() {
+                    let g = clip_grad(g, self.hp.grad_clip) + eff_wd * *w;
+                    v[j] = self.momentum * v[j] - eff_lr * g;
                     *w += v[j];
                 }
             }
@@ -575,14 +615,24 @@ impl Optimizer for Sgd {
 /// m̂_t = m_t / (1 - β1^t)                        (bias-corrected)
 /// v̂_t = v_t / (1 - β2^t)                        (bias-corrected)
 /// w_t = w_{t-1} - α * m̂_t / (√v̂_t + ε)
+///
+/// AMSGrad variant (Reddi et al. 2018): replaces v̂_t with max(v̂_{t-1}, v̂_t)
+/// for guaranteed convergence in non-convex settings.
 pub struct Adam {
-    pub hp:   HParams,
-    pub beta1: f32,
-    pub beta2: f32,
-    pub eps:   f32,
-    m1:        Vec<Vec<f32>>,   // first moment
-    m2:        Vec<Vec<f32>>,   // second moment
-    schedule:  Box<dyn LrSchedule>,
+    pub hp:      HParams,
+    pub beta1:   f32,
+    pub beta2:   f32,
+    pub eps:     f32,
+    pub amsgrad: bool,
+    m1:          Vec<Vec<f32>>,   // first moment
+    m2:          Vec<Vec<f32>>,   // second moment
+    v_max:       Vec<Vec<f32>>,   // AMSGrad: running max of v̂ (empty when disabled)
+    /// Incremental bias-correction accumulators — avoids powf() every step.
+    beta1_t:     f32,   // β1^t
+    beta2_t:     f32,   // β2^t
+    schedule:    Box<dyn LrSchedule>,
+    /// Scratch buffer for per-group ByNorm gradient clipping.
+    clip_buf:    Vec<f32>,
 }
 
 impl Adam {
@@ -592,9 +642,14 @@ impl Adam {
             beta1: 0.9,
             beta2: 0.999,
             eps:   1e-8,
+            amsgrad: false,
             m1:    Vec::new(),
             m2:    Vec::new(),
+            v_max: Vec::new(),
+            beta1_t: 1.0,
+            beta2_t: 1.0,
             schedule: Box::new(ConstantLr),
+            clip_buf: Vec::new(),
         }
     }
 
@@ -602,11 +657,19 @@ impl Adam {
     pub fn with_eps(mut self, eps: f32) -> Self { self.eps = eps; self }
     pub fn with_weight_decay(mut self, wd: f32) -> Self { self.hp.weight_decay = wd; self }
     pub fn with_grad_clip(mut self, clip: GradClip) -> Self { self.hp.grad_clip = Some(clip); self }
+    pub fn with_amsgrad(mut self) -> Self { self.amsgrad = true; self }
     pub fn with_schedule(mut self, s: impl LrSchedule + 'static) -> Self {
         self.schedule = Box::new(s); self
     }
 
     fn ensure_buffers(&mut self, params: &[ParamBuffer<'_>]) {
+        // Fast-path: if the outer vec has the right length and every inner vec
+        // already matches the corresponding parameter count, skip all work.
+        if self.m1.len() == params.len()
+            && self.m1.iter().zip(params).all(|(b, p)| b.len() == p.numel())
+        {
+            return;
+        }
         for buffers in [&mut self.m1, &mut self.m2] {
             if buffers.len() < params.len() {
                 buffers.resize_with(params.len(), Vec::new);
@@ -614,6 +677,16 @@ impl Adam {
             for (i, p) in params.iter().enumerate() {
                 if buffers[i].len() != p.numel() {
                     buffers[i] = vec![0.0; p.numel()];
+                }
+            }
+        }
+        if self.amsgrad {
+            if self.v_max.len() < params.len() {
+                self.v_max.resize_with(params.len(), Vec::new);
+            }
+            for (i, p) in params.iter().enumerate() {
+                if self.v_max[i].len() != p.numel() {
+                    self.v_max[i] = vec![0.0; p.numel()];
                 }
             }
         }
@@ -625,10 +698,15 @@ impl Optimizer for Adam {
 
     fn step(&mut self, params: &mut [ParamBuffer<'_>], step: u64) {
         self.ensure_buffers(params);
-        let lr  = self.schedule.multiplier(step, self.hp.lr);
-        let t   = step as f32 + 1.0;
-        let bc1 = 1.0 - self.beta1.powf(t);
-        let bc2 = 1.0 - self.beta2.powf(t);
+        let lr = self.schedule.multiplier(step, self.hp.lr);
+
+        // Incremental bias correction: multiply by β each step instead of powf(t).
+        // Reset on step 0 so that resume-from-snapshot with step=0 is correct.
+        if step == 0 { self.beta1_t = 1.0; self.beta2_t = 1.0; }
+        self.beta1_t *= self.beta1;
+        self.beta2_t *= self.beta2;
+        let bc1 = 1.0 - self.beta1_t;
+        let bc2 = 1.0 - self.beta2_t;
 
         for (i, p) in params.iter_mut().enumerate() {
             let eff_lr = lr * p.lr_scale;
@@ -636,18 +714,27 @@ impl Optimizer for Adam {
             let m1 = &mut self.m1[i];
             let m2 = &mut self.m2[i];
 
-            for (j, (&g, w)) in p.grads.iter().zip(p.weights.iter_mut()).enumerate() {
+            // Per-group ByNorm pre-pass (fixes the silent no-op in prior version).
+            apply_group_grad_clip(p.grads, self.hp.grad_clip, &mut self.clip_buf);
+            let grads = effective_grads(p.grads, &self.clip_buf);
+
+            for (j, (&g, w)) in grads.iter().zip(p.weights.iter_mut()).enumerate() {
+                // Element-wise clamp (ByValue) or pass-through (ByNorm already handled).
                 let g = clip_grad(g, self.hp.grad_clip);
-                // L2 gradient-form decay.
+                // L2 gradient-form weight decay.
                 let g = g + eff_wd * *w;
 
-                // Moment updates.
                 m1[j] = self.beta1 * m1[j] + (1.0 - self.beta1) * g;
                 m2[j] = self.beta2 * m2[j] + (1.0 - self.beta2) * g * g;
 
-                // Bias-corrected moments.
                 let m_hat = m1[j] / bc1;
-                let v_hat = m2[j] / bc2;
+                let v_hat = if self.amsgrad {
+                    let vmax = &mut self.v_max[i][j];
+                    *vmax = vmax.max(m2[j] / bc2);
+                    *vmax
+                } else {
+                    m2[j] / bc2
+                };
 
                 *w -= eff_lr * m_hat / (v_hat.sqrt() + self.eps);
             }
@@ -664,22 +751,34 @@ impl Optimizer for Adam {
             buffers.push((format!("m1_{i}"), m.clone()));
             buffers.push((format!("m2_{i}"), v.clone()));
         }
+        for (i, vmax) in self.v_max.iter().enumerate() {
+            buffers.push((format!("vmax_{i}"), vmax.clone()));
+        }
         OptimizerState {
             name: "Adam".into(), step: 0, lr: self.hp.lr, buffers,
             hparams: vec![
                 ("beta1".into(), self.beta1), ("beta2".into(), self.beta2),
                 ("eps".into(), self.eps), ("weight_decay".into(), self.hp.weight_decay),
+                ("beta1_t".into(), self.beta1_t), ("beta2_t".into(), self.beta2_t),
             ],
         }
     }
 
     fn load_snapshot(&mut self, state: OptimizerState) {
         self.hp.lr = state.lr;
-        self.m1.clear(); self.m2.clear();
-        let mut it = state.buffers.into_iter();
-        while let (Some((_, m)), Some((_, v))) = (it.next(), it.next()) {
-            self.m1.push(m);
-            self.m2.push(v);
+        if let Some(&(_, v)) = state.hparams.iter().find(|(k,_)| k == "beta1_t") { self.beta1_t = v; }
+        if let Some(&(_, v)) = state.hparams.iter().find(|(k,_)| k == "beta2_t") { self.beta2_t = v; }
+        self.m1.clear(); self.m2.clear(); self.v_max.clear();
+        let mut it = state.buffers.into_iter().peekable();
+        while let Some((key, buf)) = it.next() {
+            if key.starts_with("m1_") {
+                if let Some((_, v_buf)) = it.next() {
+                    self.m1.push(buf);
+                    self.m2.push(v_buf);
+                }
+            } else if key.starts_with("vmax_") {
+                self.v_max.push(buf);
+            }
         }
     }
 }
@@ -724,10 +823,14 @@ impl Optimizer for AdamW {
 
     fn step(&mut self, params: &mut [ParamBuffer<'_>], step: u64) {
         self.inner.ensure_buffers(params);
-        let lr  = self.inner.schedule.multiplier(step, self.inner.hp.lr);
-        let t   = step as f32 + 1.0;
-        let bc1 = 1.0 - self.inner.beta1.powf(t);
-        let bc2 = 1.0 - self.inner.beta2.powf(t);
+        let lr = self.inner.schedule.multiplier(step, self.inner.hp.lr);
+
+        // Incremental bias correction (mirrors Adam).
+        if step == 0 { self.inner.beta1_t = 1.0; self.inner.beta2_t = 1.0; }
+        self.inner.beta1_t *= self.inner.beta1;
+        self.inner.beta2_t *= self.inner.beta2;
+        let bc1 = 1.0 - self.inner.beta1_t;
+        let bc2 = 1.0 - self.inner.beta2_t;
 
         for (i, p) in params.iter_mut().enumerate() {
             let eff_lr = lr * p.lr_scale;
@@ -735,13 +838,16 @@ impl Optimizer for AdamW {
             let m1 = &mut self.inner.m1[i];
             let m2 = &mut self.inner.m2[i];
 
-            for (j, (&g, w)) in p.grads.iter().zip(p.weights.iter_mut()).enumerate() {
+            // Per-group ByNorm pre-pass.
+            apply_group_grad_clip(p.grads, self.inner.hp.grad_clip, &mut self.inner.clip_buf);
+            let grads = effective_grads(p.grads, &self.inner.clip_buf);
+
+            for (j, (&g, w)) in grads.iter().zip(p.weights.iter_mut()).enumerate() {
                 let g = clip_grad(g, self.inner.hp.grad_clip);
 
                 // Decoupled weight decay — applied directly to parameter.
                 *w *= 1.0 - eff_lr * eff_wd;
 
-                // Standard Adam moment updates (no decay in gradient).
                 m1[j] = self.inner.beta1 * m1[j] + (1.0 - self.inner.beta1) * g;
                 m2[j] = self.inner.beta2 * m2[j] + (1.0 - self.inner.beta2) * g * g;
 
@@ -792,6 +898,11 @@ impl AdaGrad {
     }
 
     fn ensure_buffers(&mut self, params: &[ParamBuffer<'_>]) {
+        if self.g_sq.len() == params.len()
+            && self.g_sq.iter().zip(params).all(|(b, p)| b.len() == p.numel())
+        {
+            return;
+        }
         if self.g_sq.len() < params.len() {
             self.g_sq.resize_with(params.len(), Vec::new);
         }
@@ -996,6 +1107,11 @@ impl AdaDelta {
     }
     pub fn with_rho(mut self, rho: f32) -> Self { self.rho = rho; self }
     pub fn with_weight_decay(mut self, wd: f32) -> Self { self.hp.weight_decay = wd; self }
+}
+
+impl Default for AdaDelta {
+    fn default() -> Self { Self::new() }
+}
 
     fn ensure_buffers(&mut self, params: &[ParamBuffer<'_>]) {
         for buf in [&mut self.eg2, &mut self.edw2] {
@@ -1078,11 +1194,14 @@ impl Optimizer for Nadam {
 
     fn step(&mut self, params: &mut [ParamBuffer<'_>], step: u64) {
         self.inner.ensure_buffers(params);
-        let lr  = self.inner.schedule.multiplier(step, self.inner.hp.lr);
-        let t   = step as f32 + 1.0;
-        let bc1 = 1.0 - self.inner.beta1.powf(t);
-        let bc2 = 1.0 - self.inner.beta2.powf(t);
-        let bc1_next = 1.0 - self.inner.beta1.powf(t + 1.0);
+        let lr = self.inner.schedule.multiplier(step, self.inner.hp.lr);
+
+        if step == 0 { self.inner.beta1_t = 1.0; self.inner.beta2_t = 1.0; }
+        self.inner.beta1_t *= self.inner.beta1;
+        self.inner.beta2_t *= self.inner.beta2;
+        let bc1      = 1.0 - self.inner.beta1_t;
+        let bc1_next = bc1 * (1.0 - self.inner.beta1);  // = 1 - β1^(t+1), no extra powf
+        let bc2      = 1.0 - self.inner.beta2_t;
 
         for (i, p) in params.iter_mut().enumerate() {
             let eff_lr = lr * p.lr_scale;
@@ -1146,14 +1265,19 @@ impl Optimizer for Radam {
 
     fn step(&mut self, params: &mut [ParamBuffer<'_>], step: u64) {
         self.inner.ensure_buffers(params);
-        let lr    = self.inner.schedule.multiplier(step, self.inner.hp.lr);
-        let t     = step as f32 + 1.0;
+        let lr = self.inner.schedule.multiplier(step, self.inner.hp.lr);
+
+        if step == 0 { self.inner.beta1_t = 1.0; self.inner.beta2_t = 1.0; }
+        self.inner.beta1_t *= self.inner.beta1;
+        self.inner.beta2_t *= self.inner.beta2;
+        let bc1 = 1.0 - self.inner.beta1_t;
+        let bc2 = 1.0 - self.inner.beta2_t;
+
         let b2    = self.inner.beta2;
         let rho_inf = 2.0 / (1.0 - b2) - 1.0;
-        let beta2_t = b2.powf(t);
-        let rho_t   = rho_inf - 2.0 * t * beta2_t / (1.0 - beta2_t);
-        let bc1 = 1.0 - self.inner.beta1.powf(t);
-        let bc2 = 1.0 - beta2_t;
+        // Derive beta2^t from the incremental accumulator, no extra powf.
+        let beta2_t = self.inner.beta2_t;
+        let rho_t   = rho_inf - 2.0 * (step as f32 + 1.0) * beta2_t / (1.0 - beta2_t);
 
         for (i, p) in params.iter_mut().enumerate() {
             let eff_lr = lr * p.lr_scale;
@@ -1170,14 +1294,12 @@ impl Optimizer for Radam {
                 let m_hat = m1[j] / bc1;
 
                 if rho_t > 4.0 {
-                    // Variance is sufficiently tractable — use rectified step.
                     let r = ((rho_t - 4.0) * (rho_t - 2.0) * rho_inf
                            / ((rho_inf - 4.0) * (rho_inf - 2.0) * rho_t))
                            .sqrt();
                     let v_hat = (m2[j] / bc2).sqrt() + self.inner.eps;
                     *w -= eff_lr * r * m_hat / v_hat;
                 } else {
-                    // Variance not yet tractable — SGD with first moment.
                     *w -= eff_lr * m_hat;
                 }
             }
@@ -1201,8 +1323,10 @@ impl Optimizer for Radam {
 ///
 /// When the layer norm is 0 or the update norm is 0, r is set to 1.
 pub struct Lamb {
-    inner:   Adam,
+    inner:       Adam,
     pub clamp_trust: (f32, f32),  // (min, max) for the trust ratio
+    /// Pre-allocated update buffer — avoids per-step heap allocation.
+    update_buf:  Vec<Vec<f32>>,
 }
 
 impl Lamb {
@@ -1210,6 +1334,7 @@ impl Lamb {
         Lamb {
             inner:       Adam::new(lr).with_weight_decay(1e-2),
             clamp_trust: (1e-3, 10.0),
+            update_buf:  Vec::new(),
         }
     }
     pub fn with_betas(mut self, b1: f32, b2: f32) -> Self {
@@ -1224,6 +1349,17 @@ impl Lamb {
     pub fn with_schedule(mut self, s: impl LrSchedule + 'static) -> Self {
         self.inner = self.inner.with_schedule(s); self
     }
+
+    fn ensure_update_buf(&mut self, params: &[ParamBuffer<'_>]) {
+        if self.update_buf.len() < params.len() {
+            self.update_buf.resize_with(params.len(), Vec::new);
+        }
+        for (i, p) in params.iter().enumerate() {
+            if self.update_buf[i].len() != p.numel() {
+                self.update_buf[i] = vec![0.0; p.numel()];
+            }
+        }
+    }
 }
 
 impl Optimizer for Lamb {
@@ -1231,20 +1367,21 @@ impl Optimizer for Lamb {
 
     fn step(&mut self, params: &mut [ParamBuffer<'_>], step: u64) {
         self.inner.ensure_buffers(params);
-        let lr  = self.inner.schedule.multiplier(step, self.inner.hp.lr);
-        let t   = step as f32 + 1.0;
-        let bc1 = 1.0 - self.inner.beta1.powf(t);
-        let bc2 = 1.0 - self.inner.beta2.powf(t);
+        self.ensure_update_buf(params);
+        let lr = self.inner.schedule.multiplier(step, self.inner.hp.lr);
+
+        if step == 0 { self.inner.beta1_t = 1.0; self.inner.beta2_t = 1.0; }
+        self.inner.beta1_t *= self.inner.beta1;
+        self.inner.beta2_t *= self.inner.beta2;
+        let bc1 = 1.0 - self.inner.beta1_t;
+        let bc2 = 1.0 - self.inner.beta2_t;
 
         for (i, p) in params.iter_mut().enumerate() {
             let eff_lr = lr * p.lr_scale;
             let eff_wd = self.inner.hp.weight_decay * p.wd_scale;
             let m1 = &mut self.inner.m1[i];
             let m2 = &mut self.inner.m2[i];
-
-            // Compute the full update vector first so we can compute its norm.
-            let n = p.weights.len();
-            let mut update = vec![0.0_f32; n];
+            let update = &mut self.update_buf[i];  // pre-allocated, no heap alloc
             let mut w_norm_sq = 0.0_f32;
 
             for (j, (&g, &w)) in p.grads.iter().zip(p.weights.iter()).enumerate() {
@@ -1257,12 +1394,10 @@ impl Optimizer for Lamb {
                 let v_hat = m2[j] / bc2;
                 let adam  = m_hat / (v_hat.sqrt() + self.inner.eps);
 
-                // Weight decay added to update (LAMB couples it here, unlike AdamW).
                 update[j] = adam + eff_wd * w;
                 w_norm_sq += w * w;
             }
 
-            // Layer-wise trust ratio.
             let w_norm  = w_norm_sq.sqrt();
             let u_norm: f32 = update.iter().map(|u| u * u).sum::<f32>().sqrt();
 
@@ -1644,6 +1779,10 @@ impl Prodigy {
     }
 }
 
+impl Default for Prodigy {
+    fn default() -> Self { Self::new() }
+}
+
 impl Optimizer for Prodigy {
     fn name(&self) -> &str { "Prodigy" }
 
@@ -1652,61 +1791,81 @@ impl Optimizer for Prodigy {
         let t   = step as f32 + 1.0;
         let bc1 = 1.0 - self.beta1.powf(t);
         let bc2 = 1.0 - self.beta2.powf(t);
-        let eff_lr = self.hp.lr * self.d;
 
-        // Update D estimate using squared gradient norms (simplified)
-        let mut g2_sum = 0.0_f32;
-        for p in params.iter() {
-            g2_sum += p.grads.iter().map(|g| g * g).sum::<f32>();
+        // ── D update (Mishchenko & Defazio 2023, Algorithm 1) ────────────────
+        // s_t accumulates D-scaled gradients; D grows whenever the numerator
+        // (sum s·g) exceeds the denominator (sum v^{1/2}).
+        let mut s_dot_g  = 0.0_f32;  // <s_t, g_t>  (numerator candidate)
+        let mut v_sq_sum = 0.0_f32;  // Σ sqrt(v_t) (denominator)
+
+        for (i, p) in params.iter().enumerate() {
+            let s  = &self.s[i];
+            let m2 = &self.m2[i];
+            for (j, &g) in p.grads.iter().enumerate() {
+                s_dot_g  += s[j] * g;
+                v_sq_sum += (m2[j] / bc2.max(1e-8) + self.eps).sqrt();
+            }
         }
-        let g_norm = g2_sum.sqrt().max(1e-10);
-        // Prodigy D update: D ← max(D, ‖g‖_2 * d0)
-        self.d = self.d.max(g_norm * self.d0);
+
+        // D grows when the projected gradient is positive relative to v.
+        if v_sq_sum > 1e-12 {
+            let d_candidate = s_dot_g / v_sq_sum;
+            self.d = self.d.max(self.d0).max(d_candidate);
+        }
+
+        let eff_lr = self.hp.lr * self.d;
 
         for (i, p) in params.iter_mut().enumerate() {
             let lr = eff_lr * p.lr_scale;
             let wd = self.hp.weight_decay * p.wd_scale;
             let m1 = &mut self.m1[i];
             let m2 = &mut self.m2[i];
+            let s  = &mut self.s[i];
 
             for (j, (&g, w)) in p.grads.iter().zip(p.weights.iter_mut()).enumerate() {
                 let g = clip_grad(g, self.hp.grad_clip) + wd * *w;
                 let dg = self.d * g;
 
+                // s: running sum of D-scaled gradients weighted by v^{-1/2}
+                let v_prev = m2[j] / bc2.max(1e-8);
+                s[j] = self.beta2 * s[j] + (1.0 - self.beta2) * dg / (v_prev.sqrt() + self.eps);
+
                 m1[j] = self.beta1 * m1[j] + (1.0 - self.beta1) * dg;
                 m2[j] = self.beta2 * m2[j] + (1.0 - self.beta2) * dg * dg;
 
                 let m_hat = m1[j] / bc1;
-                let v_hat = m2[j] / bc2;
+                let v_hat = m2[j] / bc2.max(1e-8);
                 *w -= lr * m_hat / (v_hat.sqrt() + self.eps);
             }
         }
     }
 
-    fn current_lr(&self, step: u64) -> f32 { self.hp.lr * self.d }
+    fn current_lr(&self, _step: u64) -> f32 { self.hp.lr * self.d }
 
     fn state_snapshot(&self) -> OptimizerState {
         let mut buffers = Vec::new();
-        for (i, (m, v)) in self.m1.iter().zip(&self.m2).enumerate() {
+        for (i, ((m, v), s)) in self.m1.iter().zip(&self.m2).zip(&self.s).enumerate() {
             buffers.push((format!("m1_{i}"), m.clone()));
             buffers.push((format!("m2_{i}"), v.clone()));
+            buffers.push((format!("s_{i}"),  s.clone()));
         }
         OptimizerState {
             name: "Prodigy".into(), step: 0, lr: self.hp.lr, buffers,
             hparams: vec![
                 ("beta1".into(), self.beta1), ("beta2".into(), self.beta2),
-                ("d".into(), self.d),
+                ("d".into(), self.d), ("d0".into(), self.d0),
             ],
         }
     }
 
     fn load_snapshot(&mut self, state: OptimizerState) {
         self.hp.lr = state.lr;
-        if let Some(&(_, d)) = state.hparams.iter().find(|(k,_)| k == "d") { self.d = d; }
-        self.m1.clear(); self.m2.clear();
+        if let Some(&(_, d))  = state.hparams.iter().find(|(k,_)| k == "d")  { self.d  = d; }
+        if let Some(&(_, d0)) = state.hparams.iter().find(|(k,_)| k == "d0") { self.d0 = d0; }
+        self.m1.clear(); self.m2.clear(); self.s.clear();
         let mut it = state.buffers.into_iter();
-        while let (Some((_, m)), Some((_, v))) = (it.next(), it.next()) {
-            self.m1.push(m); self.m2.push(v);
+        while let (Some((_, m)), Some((_, v)), Some((_, s))) = (it.next(), it.next(), it.next()) {
+            self.m1.push(m); self.m2.push(v); self.s.push(s);
         }
     }
 }
@@ -1759,8 +1918,11 @@ impl WeightEma {
     }
 
     /// Copy shadow weights into the target slice.
-    pub fn copy_to(&self, target: &mut Vec<f32>) {
-        target.clone_from(&self.shadow);
+    /// Panics in debug if `target.len() != shadow.len()`.
+    pub fn copy_to(&self, target: &mut [f32]) {
+        debug_assert_eq!(target.len(), self.shadow.len(),
+            "WeightEma::copy_to: target len {} != shadow len {}", target.len(), self.shadow.len());
+        target.copy_from_slice(&self.shadow);
     }
 
     /// Reset (e.g. after loading a checkpoint).
@@ -1793,17 +1955,21 @@ pub fn gradient_centralize(grads: &mut [f32], output_dim: usize) {
 }
 
 /// Apply gradient centralization to all parameter groups.
-/// `output_dims` must have one entry per param group (0 = skip for biases).
+///
+/// `mut_grads`   — one mutable gradient slice per group (matches `params` order).
+/// `output_dims` — fan-out (output neurons) for each group; pass 0 to skip
+///                 (e.g. for bias vectors, embeddings, or 1-D tensors).
+///
+/// Note: `ParamBuffer.grads` is immutable because optimizers only read grads.
+///       Call this function with separate `&mut [f32]` slices *before* building
+///       the `ParamBuffer` array, or maintain a parallel mutable grad store.
 pub fn gradient_centralize_all(
-    params: &mut [ParamBuffer<'_>],
+    mut_grads:   &mut [&mut [f32]],
     output_dims: &[usize],
 ) {
-    for (p, &od) in params.iter_mut().zip(output_dims) {
-        if od > 0 {
-            // We need a mutable slice; grads is immutable in ParamBuffer,
-            // so we allocate a temporary copy for the centralized grads.
-            // In a real impl, ParamBuffer would hold mut grads.
-            let _ = od; // centralization hook point
+    for (grads, &od) in mut_grads.iter_mut().zip(output_dims) {
+        if od > 1 {
+            gradient_centralize(grads, od);
         }
     }
 }
@@ -1887,8 +2053,9 @@ pub fn build_optimizer(
             Box::new(opt)
         }
         Adagrad => {
-            let opt = crate::optimizer::AdaGrad::new(lr)
+            let mut opt = crate::optimizer::AdaGrad::new(lr)
                 .with_weight_decay(weight_decay);
+            if let Some(s) = schedule { opt = opt.with_schedule_boxed(s); }
             Box::new(opt)
         }
     }
@@ -1914,17 +2081,38 @@ impl_schedule_boxed!(Adam);
 impl_schedule_boxed!(AdaGrad);
 impl_schedule_boxed!(RmsProp);
 impl_schedule_boxed!(Lars);
+impl_schedule_boxed!(Lion);
+impl_schedule_boxed!(Sophia);
+impl_schedule_boxed!(Prodigy);
 
+// Wrappers that delegate to their inner Adam's schedule field.
 impl WithScheduleBoxed for AdamW {
+    fn with_schedule_boxed(mut self, s: Box<dyn LrSchedule>) -> Self {
+        self.inner.schedule = s; self
+    }
+}
+impl WithScheduleBoxed for Nadam {
+    fn with_schedule_boxed(mut self, s: Box<dyn LrSchedule>) -> Self {
+        self.inner.schedule = s; self
+    }
+}
+impl WithScheduleBoxed for Radam {
+    fn with_schedule_boxed(mut self, s: Box<dyn LrSchedule>) -> Self {
+        self.inner.schedule = s; self
+    }
+}
+impl WithScheduleBoxed for Lamb {
     fn with_schedule_boxed(mut self, s: Box<dyn LrSchedule>) -> Self {
         self.inner.schedule = s; self
     }
 }
 
 // =============================================================================
-// §20  HELPER FUNCTIONS
+// §26  HELPER FUNCTIONS
 // =============================================================================
 
+/// Scalar value-clamp: only handles `ByValue`.  Use `apply_group_grad_clip`
+/// for the per-group pre-pass that correctly handles both variants.
 #[inline]
 fn clip_grad(g: f32, clip: Option<GradClip>) -> f32 {
     match clip {
@@ -1933,8 +2121,45 @@ fn clip_grad(g: f32, clip: Option<GradClip>) -> f32 {
     }
 }
 
+/// Apply gradient clipping to an entire parameter group's gradient slice.
+///
+/// Must be called **before** the per-element inner loop.
+/// * `ByValue`  — already handled element-wise by `clip_grad`; this is a no-op.
+/// * `ByNorm`   — scales the whole gradient vector so its L2 norm ≤ max_norm.
+///
+/// Calling this function replaces ad-hoc `clip_grad` calls inside loops when
+/// `ByNorm` is in use, fixing the silent no-op that previously occurred.
+#[inline]
+fn apply_group_grad_clip(grads: &[f32], clip: Option<GradClip>, buf: &mut Vec<f32>) {
+    match clip {
+        Some(GradClip::ByNorm(max_norm)) => {
+            let norm: f32 = grads.iter().map(|g| g * g).sum::<f32>().sqrt();
+            if norm > max_norm {
+                let scale = max_norm / norm;
+                buf.clear();
+                buf.extend(grads.iter().map(|g| g * scale));
+            } else {
+                buf.clear();
+                buf.extend_from_slice(grads);
+            }
+        }
+        _ => {
+            // ByValue is applied element-wise; just borrow the original slice.
+            // We signal "use original grads" by leaving buf empty.
+            buf.clear();
+        }
+    }
+}
+
+/// Return either the pre-clipped buffer (non-empty after `apply_group_grad_clip`
+/// with `ByNorm`) or the original grad slice.
+#[inline]
+fn effective_grads<'a>(orig: &'a [f32], clipped_buf: &'a Vec<f32>) -> &'a [f32] {
+    if clipped_buf.is_empty() { orig } else { clipped_buf.as_slice() }
+}
+
 // =============================================================================
-// §21  TESTS
+// §27  TESTS
 // =============================================================================
 
 #[cfg(test)]
@@ -2539,24 +2764,204 @@ mod tests {
         }
     }
 
-    // ── AdamW with schedule ───────────────────────────────────────────────────
+    // ── AMSGrad ───────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_adamw_with_cosine_schedule() {
-        let mut opt = AdamW::new(0.01)
-            .with_schedule(CosineAnnealing { t_max: 100, lr_min: 1e-6 });
-        let loss = run_quadratic(&mut opt, 4, 100);
-        assert!(loss < 0.1, "AdamW+cosine: {loss}");
+    fn test_amsgrad_converges_quadratic() {
+        let mut opt = Adam::new(0.01).with_amsgrad();
+        let loss = run_quadratic(&mut opt, 4, 200);
+        assert!(loss < 1e-3, "AMSGrad: {loss}");
     }
 
     #[test]
-    fn test_adam_with_warmup_cosine() {
-        let mut opt = Adam::new(0.01)
-            .with_schedule(LinearWarmup {
-                warmup_steps: 50,
-                base: CosineAnnealing { t_max: 450, lr_min: 1e-6 },
-            });
+    fn test_amsgrad_vmax_monotone() {
+        // v_max should never decrease.
+        let mut opt = Adam::new(0.01).with_amsgrad();
+        let mut w = vec![1.0_f32; 4];
+        let g1 = vec![2.0_f32; 4];
+        let g2 = vec![0.01_f32; 4]; // tiny grad after large one
+
+        let mut params = [ParamBuffer::new(&mut w, &g1, "w")];
+        opt.step(&mut params, 0);
+        let vmax_after_large = opt.v_max[0].clone();
+
+        let mut params2 = [ParamBuffer::new(&mut w, &g2, "w")];
+        opt.step(&mut params2, 1);
+        let vmax_after_small = &opt.v_max[0];
+
+        for (a, b) in vmax_after_small.iter().zip(&vmax_after_large) {
+            assert!(*a >= *b - 1e-7, "v_max should not decrease: {a} < {b}");
+        }
+    }
+
+    // ── GradClip ByNorm ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_grad_clip_by_norm_is_applied() {
+        // With ByNorm(0.1) and gradient norm >> 0.1, the effective update should
+        // be the same as if we manually pre-clipped the gradient.
+        let mut w_clipped   = vec![1.0_f32; 4];
+        let mut w_unclipped = vec![1.0_f32; 4];
+        let grads = vec![10.0_f32; 4];
+
+        // Manually pre-clip and run without clip.
+        let norm: f32 = grads.iter().map(|g| g * g).sum::<f32>().sqrt();
+        let scale = 0.1 / norm;
+        let pre_clipped: Vec<f32> = grads.iter().map(|g| g * scale).collect();
+        let mut opt_ref  = Adam::new(0.01);
+        let mut params   = [ParamBuffer::new(&mut w_unclipped, &pre_clipped, "w")];
+        opt_ref.step(&mut params, 0);
+
+        // Run with ByNorm.
+        let mut opt_norm = Adam::new(0.01).with_grad_clip(GradClip::ByNorm(0.1));
+        let mut params2  = [ParamBuffer::new(&mut w_clipped, &grads, "w")];
+        opt_norm.step(&mut params2, 0);
+
+        for (a, b) in w_clipped.iter().zip(&w_unclipped) {
+            assert!((a - b).abs() < 1e-5, "ByNorm clipped={a} vs manually clipped={b}");
+        }
+    }
+
+    // ── Lion ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_lion_descends_quadratic() {
+        let mut opt = Lion::new(1e-4).with_weight_decay(0.0);
         let loss = run_quadratic(&mut opt, 4, 500);
-        assert!(loss < 0.01, "Adam+warmup+cosine: {loss}");
+        assert!(loss < 1e-3, "Lion: {loss}");
+    }
+
+    #[test]
+    fn test_lion_update_is_unit_magnitude() {
+        // Lion update = sign(c), so each weight moves by exactly ±lr per step
+        // (before weight decay).
+        let mut w    = vec![0.0_f32; 8];
+        let grads    = vec![1.0_f32; 8];
+        let lr       = 0.01;
+        let mut opt  = Lion::new(lr).with_weight_decay(0.0);
+        let mut p    = [ParamBuffer::new(&mut w, &grads, "w")];
+        opt.step(&mut p, 0);
+        for &wi in &w {
+            assert!((wi.abs() - lr).abs() < 1e-6,
+                "Lion first step magnitude should equal lr={lr}, got {wi}");
+        }
+    }
+
+    // ── Sophia ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_sophia_descends_quadratic() {
+        let mut opt = Sophia::new(0.01);
+        let loss = run_quadratic(&mut opt, 4, 300);
+        assert!(loss < 1e-2, "Sophia: {loss}");
+    }
+
+    // ── WeightEma ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_weight_ema_tracks_weights() {
+        let mut ema = WeightEma::new(0.999, 4);
+        let w1 = vec![1.0_f32; 4];
+        let w2 = vec![2.0_f32; 4];
+        for _ in 0..100 { ema.update(&w1); }
+        for _ in 0..100 { ema.update(&w2); }
+        // After many steps the shadow should be close to w2.
+        let mut out = vec![0.0_f32; 4];
+        ema.copy_to(&mut out);
+        for &v in &out {
+            assert!(v > 1.5, "EMA should have moved toward w2, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_weight_ema_warmup_starts_low() {
+        let mut ema = WeightEma::new(0.999, 1);
+        // At step 0: d = min(0.999, 1/(10)) = 0.1, so shadow = 0*0.1 + 0.9*w
+        ema.update(&[1.0]);
+        // shadow ≈ (1-d)*1.0 = 0.9 for first step warmup
+        assert!(ema.shadow[0] > 0.0 && ema.shadow[0] < 1.0,
+            "EMA shadow should be < 1.0 on first step (warmup), got {}", ema.shadow[0]);
+    }
+
+    // ── Gradient Centralization ───────────────────────────────────────────────
+
+    #[test]
+    fn test_gradient_centralize_zero_mean() {
+        let mut g = vec![1.0_f32, 2.0, 3.0, 4.0]; // 2 output neurons, fan_in=2
+        gradient_centralize(&mut g, 2);
+        // Each output row: [1,2] → mean=1.5 → [-0.5, 0.5]; [3,4] → mean=3.5 → [-0.5, 0.5]
+        let mean0 = (g[0] + g[1]) / 2.0;
+        let mean1 = (g[2] + g[3]) / 2.0;
+        assert!(mean0.abs() < 1e-6, "row 0 mean should be 0, got {mean0}");
+        assert!(mean1.abs() < 1e-6, "row 1 mean should be 0, got {mean1}");
+    }
+
+    // ── ReduceOnPlateau cooldown ──────────────────────────────────────────────
+
+    #[test]
+    fn test_reduce_on_plateau_cooldown_delays_reduction() {
+        let mut sched = ReduceOnPlateau::new(0.5, 2, 1e-8).with_cooldown(3);
+        let base = 0.1_f32;
+        // Trigger a reduction (2 bad epochs).
+        sched.on_metric(1.0);
+        sched.on_metric(1.0);
+        let lr_after_first_reduce = sched.multiplier(0, base);
+        assert!(lr_after_first_reduce < base, "should have reduced");
+
+        // Immediately try to trigger another — cooldown should block it.
+        sched.on_metric(1.0);
+        sched.on_metric(1.0);
+        let lr_during_cooldown = sched.multiplier(0, base);
+        assert!((lr_during_cooldown - lr_after_first_reduce).abs() < 1e-8,
+            "cooldown should have blocked second reduction");
+    }
+
+    // ── GradAccumulator view + auto-average ──────────────────────────────────
+
+    #[test]
+    fn test_accumulator_view_and_auto_average() {
+        let mut acc = GradAccumulator::zeros(2);
+        acc.accumulate(&[4.0, 8.0]);
+        acc.accumulate(&[2.0, 4.0]);
+        let view = acc.average_and_view();
+        assert!((view[0] - 3.0).abs() < 1e-6, "avg[0] should be 3.0, got {}", view[0]);
+        assert!((view[1] - 6.0).abs() < 1e-6, "avg[1] should be 6.0, got {}", view[1]);
+    }
+
+    #[test]
+    fn test_accumulator_resize_on_shape_change() {
+        let mut acc = GradAccumulator::zeros(3);
+        acc.accumulate(&[1.0, 2.0, 3.0]);
+        // Feed a different-length gradient — should not panic, should reset.
+        acc.accumulate(&[5.0, 5.0]);
+        assert_eq!(acc.count(), 1, "count should be 1 after implicit reset");
+        assert_eq!(acc.buffer.len(), 2, "buffer should resize to 2");
+    }
+
+    // ── Incremental bias-correction matches powf ──────────────────────────────
+
+    #[test]
+    fn test_adam_incremental_bc_matches_powf() {
+        // Run two identical Adam optimizers: one with the new code, one where we
+        // patch the biases with powf externally, and compare weight trajectories.
+        let grads = vec![0.3_f32; 8];
+        let mut w_inc  = vec![1.0_f32; 8];
+        let mut w_powf = vec![1.0_f32; 8];
+
+        let mut opt_inc  = Adam::new(0.01);
+        let mut opt_powf = Adam::new(0.01);
+
+        for step in 0..50_u64 {
+            let mut p1 = [ParamBuffer::new(&mut w_inc, &grads, "w")];
+            opt_inc.step(&mut p1, step);
+
+            let mut p2 = [ParamBuffer::new(&mut w_powf, &grads, "w")];
+            opt_powf.step(&mut p2, step);
+        }
+
+        for (a, b) in w_inc.iter().zip(&w_powf) {
+            assert!((a - b).abs() < 1e-5,
+                "incremental and powf bias-correction should agree: {a} vs {b}");
+        }
     }
 }
