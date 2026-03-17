@@ -77,6 +77,17 @@ pub enum Value {
     Tuple(Vec<Value>),
     Array(Arc<Mutex<Vec<Value>>>),
     Struct { name: String, fields: HashMap<String, Value> },
+    /// HashMap: key -> value pairs (keys currently strings)
+    HashMap(Arc<Mutex<HashMap<String, Value>>>),
+
+    // ── Option / Result types ─────────────────────────────────────────────────
+    /// `Some(value)` or `None` (for Option<T>)
+    Some(Box<Value>),
+    None,
+    /// `Ok(value)` for Result<T, E>
+    Ok(Box<Value>),
+    /// `Err(value)` for Result<T, E>
+    Err(Box<Value>),
 
     // ── Callable ─────────────────────────────────────────────────────────────
     /// A user-defined function closure (captures its definition scope).
@@ -115,7 +126,12 @@ impl Value {
             Value::Tensor(_) => "tensor",
             Value::Tuple(_)  => "tuple",
             Value::Array(_)  => "array",
+            Value::HashMap(_) => "map",
             Value::Struct { name, .. } => name,
+            Value::Some(_)   => "Some",
+            Value::None      => "None",
+            Value::Ok(_)     => "Ok",
+            Value::Err(_)    => "Err",
             Value::Fn(_)     => "fn",
             Value::Entity(_) => "entity",
             Value::World(_)  => "world",
@@ -200,6 +216,14 @@ impl fmt::Display for Value {
                 write!(f, "({})", inner.join(", "))
             }
             Value::Struct { name, .. } => write!(f, "{name} {{ … }}"),
+            Value::Some(v) => write!(f, "Some({})", v),
+            Value::None    => write!(f, "None"),
+            Value::Ok(v)   => write!(f, "Ok({})", v),
+            Value::Err(v)  => write!(f, "Err({})", v),
+            Value::HashMap(m) => {
+                let m = m.lock().unwrap();
+                write!(f, "{{ {} items }}", m.len())
+            }
             Value::Entity(id) => write!(f, "Entity({id})"),
             Value::World(_)   => write!(f, "<world>"),
             Value::Model(_)   => write!(f, "<model>"),
@@ -277,6 +301,7 @@ impl Tensor {
 
     /// Matrix multiply  C = A @ B.
     /// A: [M, K], B: [K, N] → C: [M, N].
+    /// Uses cache-blocked (tiled) 32×32 GEMM for CPU performance.
     pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor, RuntimeError> {
         if self.shape.len() < 2 || rhs.shape.len() < 2 {
             return Err(RuntimeError::new("matmul requires ≥2-D tensors"));
@@ -291,16 +316,70 @@ impl Tensor {
         let a = self.cpu_data();
         let b = rhs.cpu_data();
         let mut c = vec![0.0_f32; m * n];
-        // Naïve triple-loop; a BLAS call (ndarray / faer) goes here in prod.
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc = 0.0_f32;
-                for l in 0..k {
-                    acc += a[i * k + l] * b[l * n + j];
+
+        // Cache-tiled GEMM: 32×32 tiles fit in L1 cache.
+        const TILE: usize = 32;
+        for ii in (0..m).step_by(TILE) {
+            for jj in (0..n).step_by(TILE) {
+                for kk in (0..k).step_by(TILE) {
+                    let i_end = (ii + TILE).min(m);
+                    let j_end = (jj + TILE).min(n);
+                    let k_end = (kk + TILE).min(k);
+                    for i in ii..i_end {
+                        for l in kk..k_end {
+                            let a_il = a[i * k + l];
+                            for j in jj..j_end {
+                                c[i * n + j] += a_il * b[l * n + j];
+                            }
+                        }
+                    }
                 }
-                c[i * n + j] = acc;
             }
         }
+
+        let mut out_shape = self.shape[..self.shape.len() - 2].to_vec();
+        out_shape.push(m);
+        out_shape.push(n);
+        Ok(Tensor::from_data(out_shape, c))
+    }
+
+    /// Kronecker product  C = A @@ B.
+    /// A: [m, n], B: [p, q] → C: [m*p, n*q]
+    pub fn kron(&self, rhs: &Tensor) -> Result<Tensor, RuntimeError> {
+        if self.shape.len() != 2 || rhs.shape.len() != 2 {
+            return Err(RuntimeError::new("Kronecker product requires 2-D tensors"));
+        }
+        let (m, n) = (self.shape[0], self.shape[1]);
+        let (p, q) = (rhs.shape[0], rhs.shape[1]);
+        let a = self.cpu_data();
+        let b = rhs.cpu_data();
+        let mut c = vec![0.0_f32; m * p * n * q];
+        for i in 0..m {
+            for j in 0..n {
+                let a_ij = a[i * n + j];
+                for r in 0..p {
+                    for s in 0..q {
+                        c[(i * p + r) * (n * q) + (j * q + s)] = a_ij * b[r * q + s];
+                    }
+                }
+            }
+        }
+        Ok(Tensor::from_data(vec![m * p, n * q], c))
+    }
+
+    /// Outer product  C = a ^* b.
+    /// a: [m], b: [n] → C: [m, n]
+    pub fn outer(&self, rhs: &Tensor) -> Result<Tensor, RuntimeError> {
+        if self.shape.len() != 1 || rhs.shape.len() != 1 {
+            return Err(RuntimeError::new("outer product requires 1-D tensors"));
+        }
+        let m = self.shape[0];
+        let n = rhs.shape[0];
+        let a = self.cpu_data();
+        let b = rhs.cpu_data();
+        let c: Vec<f32> = a.iter().flat_map(|&ai| b.iter().map(move |&bj| ai * bj)).collect();
+        Ok(Tensor::from_data(vec![m, n], c))
+    }
         let mut out_shape = self.shape[..self.shape.len() - 2].to_vec();
         out_shape.push(m);
         out_shape.push(n);
@@ -320,15 +399,35 @@ impl Tensor {
     fn elementwise(&self, rhs: &Tensor, op: impl Fn(f32, f32) -> f32, name: &str)
         -> Result<Tensor, RuntimeError>
     {
-        if self.shape != rhs.shape {
-            return Err(RuntimeError::new(format!(
-                "`{name}` shape mismatch: {:?} vs {:?}", self.shape, rhs.shape
-            )));
+        // Exact shape match (fast path)
+        if self.shape == rhs.shape {
+            let a = self.cpu_data();
+            let b = rhs.cpu_data();
+            let c: Vec<f32> = a.iter().zip(b).map(|(x, y)| op(*x, *y)).collect();
+            return Ok(Tensor::from_data(self.shape.clone(), c));
         }
-        let a = self.cpu_data();
-        let b = rhs.cpu_data();
-        let c: Vec<f32> = a.iter().zip(b).map(|(x, y)| op(*x, *y)).collect();
-        Ok(Tensor::from_data(self.shape.clone(), c))
+
+        // Numpy-style broadcasting
+        let result_shape = broadcast_shape(&self.shape, &rhs.shape)
+            .ok_or_else(|| RuntimeError::new(format!(
+                "`{name}` shape mismatch: {:?} vs {:?}", self.shape, rhs.shape
+            )))?;
+
+        let n: usize = result_shape.iter().product();
+        let mut c = vec![0.0_f32; n];
+        for idx in 0..n {
+            let ai = broadcast_index(idx, &result_shape, &self.shape);
+            let bi = broadcast_index(idx, &result_shape, &rhs.shape);
+            let a = self.cpu_data();
+            let b = rhs.cpu_data();
+            c[idx] = op(a[ai], b[bi]);
+        }
+        Ok(Tensor::from_data(result_shape, c))
+    }
+
+    /// Floor division element-wise (integer rounding toward −∞).
+    pub fn floor_div(&self, rhs: &Tensor) -> Result<Tensor, RuntimeError> {
+        self.elementwise(rhs, |a, b| (a / b).floor(), "//")
     }
 
     /// Concatenate along axis 0.
@@ -1441,6 +1540,16 @@ impl Interpreter {
 
             // ── Calls ─────────────────────────────────────────────────────────
             Expr::Call { func, args, named, span } => {
+                // Check for built-in functions by name first
+                if let Expr::Ident { name, .. } = func.as_ref() {
+                    let args_v: Vec<Value> = args.iter()
+                        .map(|a| self.eval_expr(a, env))
+                        .collect::<Result<_, _>>()?;
+                    if let Ok(result) = self.eval_builtin(name, args_v) {
+                        return Ok(result);
+                    }
+                }
+                // Otherwise, try normal function evaluation
                 let args_v: Vec<Value> = args.iter()
                     .map(|a| self.eval_expr(a, env))
                     .collect::<Result<_, _>>()?;
@@ -1818,6 +1927,401 @@ impl Interpreter {
         }
     }
 
+    // ── Built-in function dispatch ────────────────────────────────────────────
+
+    fn eval_builtin(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        use std::f64::consts;
+
+        match name {
+            // ── Math functions ────────────────────────────────────────────────
+            "sin" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.sin() as f32))
+                } else { rt_err!("sin() requires a number") }
+            }
+            "cos" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.cos() as f32))
+                } else { rt_err!("cos() requires a number") }
+            }
+            "tan" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.tan() as f32))
+                } else { rt_err!("tan() requires a number") }
+            }
+            "asin" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.asin() as f32))
+                } else { rt_err!("asin() requires a number") }
+            }
+            "acos" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.acos() as f32))
+                } else { rt_err!("acos() requires a number") }
+            }
+            "atan" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.atan() as f32))
+                } else { rt_err!("atan() requires a number") }
+            }
+            "atan2" => {
+                match (args.get(0).and_then(|v| v.as_f64()), args.get(1).and_then(|v| v.as_f64())) {
+                    (Some(y), Some(x)) => Ok(Value::F32(y.atan2(x) as f32)),
+                    _ => rt_err!("atan2() requires two numbers")
+                }
+            }
+            "sqrt" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.sqrt() as f32))
+                } else { rt_err!("sqrt() requires a number") }
+            }
+            "cbrt" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.cbrt() as f32))
+                } else { rt_err!("cbrt() requires a number") }
+            }
+            "pow" => {
+                match (args.get(0).and_then(|v| v.as_f64()), args.get(1).and_then(|v| v.as_f64())) {
+                    (Some(x), Some(y)) => Ok(Value::F32(x.powf(y) as f32)),
+                    _ => rt_err!("pow() requires two numbers")
+                }
+            }
+            "exp" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.exp() as f32))
+                } else { rt_err!("exp() requires a number") }
+            }
+            "exp2" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.exp2() as f32))
+                } else { rt_err!("exp2() requires a number") }
+            }
+            "exp10" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.log10().exp() as f32))
+                } else { rt_err!("exp10() requires a number") }
+            }
+            "ln" | "log" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.ln() as f32))
+                } else { rt_err!("ln() requires a number") }
+            }
+            "log2" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.log2() as f32))
+                } else { rt_err!("log2() requires a number") }
+            }
+            "log10" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.log10() as f32))
+                } else { rt_err!("log10() requires a number") }
+            }
+            "abs" => {
+                match args.first() {
+                    Some(Value::F32(x)) => Ok(Value::F32(x.abs())),
+                    Some(Value::F64(x)) => Ok(Value::F64(x.abs())),
+                    Some(Value::I32(x)) => Ok(Value::I32(x.abs())),
+                    Some(Value::I64(x)) => Ok(Value::I64(x.abs())),
+                    Some(v) if let Some(x) = v.as_f64() => Ok(Value::F32(x.abs() as f32)),
+                    _ => rt_err!("abs() requires a number")
+                }
+            }
+            "floor" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.floor() as f32))
+                } else { rt_err!("floor() requires a number") }
+            }
+            "ceil" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.ceil() as f32))
+                } else { rt_err!("ceil() requires a number") }
+            }
+            "round" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.round() as f32))
+                } else { rt_err!("round() requires a number") }
+            }
+            "trunc" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.trunc() as f32))
+                } else { rt_err!("trunc() requires a number") }
+            }
+            "fract" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x.fract() as f32))
+                } else { rt_err!("fract() requires a number") }
+            }
+            "min" => {
+                match (args.get(0).and_then(|v| v.as_f64()), args.get(1).and_then(|v| v.as_f64())) {
+                    (Some(x), Some(y)) => Ok(Value::F32(x.min(y) as f32)),
+                    _ => rt_err!("min() requires two numbers")
+                }
+            }
+            "max" => {
+                match (args.get(0).and_then(|v| v.as_f64()), args.get(1).and_then(|v| v.as_f64())) {
+                    (Some(x), Some(y)) => Ok(Value::F32(x.max(y) as f32)),
+                    _ => rt_err!("max() requires two numbers")
+                }
+            }
+            "clamp" => {
+                match (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                ) {
+                    (Some(x), Some(lo), Some(hi)) => Ok(Value::F32((x.max(lo).min(hi)) as f32)),
+                    _ => rt_err!("clamp() requires three numbers")
+                }
+            }
+            "degrees" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32((x * 180.0 / consts::PI) as f32))
+                } else { rt_err!("degrees() requires a number") }
+            }
+            "radians" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32((x * consts::PI / 180.0) as f32))
+                } else { rt_err!("radians() requires a number") }
+            }
+            "sign" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    if x > 0.0 { Ok(Value::F32(1.0)) }
+                    else if x < 0.0 { Ok(Value::F32(-1.0)) }
+                    else { Ok(Value::F32(0.0)) }
+                } else { rt_err!("sign() requires a number") }
+            }
+            "step" => {
+                match (args.get(0).and_then(|v| v.as_f64()), args.get(1).and_then(|v| v.as_f64())) {
+                    (Some(edge), Some(x)) => Ok(Value::F32(if x >= edge { 1.0 } else { 0.0 })),
+                    _ => rt_err!("step() requires two numbers")
+                }
+            }
+            "smoothstep" => {
+                match (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                ) {
+                    (Some(edge0), Some(edge1), Some(x)) => {
+                        let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+                        Ok(Value::F32((t * t * (3.0 - 2.0 * t)) as f32))
+                    }
+                    _ => rt_err!("smoothstep() requires three numbers")
+                }
+            }
+            "mix" => {
+                match (
+                    args.get(0).and_then(|v| v.as_f64()),
+                    args.get(1).and_then(|v| v.as_f64()),
+                    args.get(2).and_then(|v| v.as_f64()),
+                ) {
+                    (Some(x), Some(y), Some(a)) => {
+                        Ok(Value::F32((x * (1.0 - a) + y * a) as f32))
+                    }
+                    _ => rt_err!("mix() requires three numbers")
+                }
+            }
+
+            // ── I/O functions ─────────────────────────────────────────────────
+            "print" => {
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 { print!(" "); }
+                    print!("{}", arg);
+                }
+                Ok(Value::Unit)
+            }
+            "println" => {
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 { print!(" "); }
+                    print!("{}", arg);
+                }
+                println!();
+                Ok(Value::Unit)
+            }
+            "dbg" => {
+                println!("[DEBUG] {:?}", args);
+                Ok(args.first().cloned().unwrap_or(Value::Unit))
+            }
+
+            // ── Type conversion ───────────────────────────────────────────────
+            "i32" => {
+                if let Some(x) = args.first().and_then(|v| v.as_i64()) {
+                    Ok(Value::I32(x as i32))
+                } else if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::I32(x as i32))
+                } else { rt_err!("i32() requires a number") }
+            }
+            "i64" => {
+                if let Some(x) = args.first().and_then(|v| v.as_i64()) {
+                    Ok(Value::I64(x))
+                } else if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::I64(x as i64))
+                } else { rt_err!("i64() requires a number") }
+            }
+            "f32" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F32(x as f32))
+                } else { rt_err!("f32() requires a number") }
+            }
+            "f64" => {
+                if let Some(x) = args.first().and_then(|v| v.as_f64()) {
+                    Ok(Value::F64(x))
+                } else { rt_err!("f64() requires a number") }
+            }
+            "bool" => {
+                Ok(Value::Bool(args.first().map(|v| v.is_truthy()).unwrap_or(false)))
+            }
+            "str" => {
+                Ok(Value::Str(args.first().map(|v| v.to_string()).unwrap_or_default()))
+            }
+
+            // ── Collection functions ──────────────────────────────────────────
+            "len" => {
+                match args.first() {
+                    Some(Value::Array(a)) => Ok(Value::I32(a.lock().unwrap().len() as i32)),
+                    Some(Value::Str(s)) => Ok(Value::I32(s.len() as i32)),
+                    Some(v) => rt_err!("len() not applicable to {}", v.type_name()),
+                    None => rt_err!("len() requires an argument")
+                }
+            }
+            "range" => {
+                match (args.get(0).and_then(|v| v.as_i64()), args.get(1).and_then(|v| v.as_i64())) {
+                    (Some(start), Some(end)) => {
+                        let range: Vec<Value> = (start as i32..end as i32).map(Value::I32).collect();
+                        Ok(Value::Array(Arc::new(Mutex::new(range))))
+                    }
+                    _ => rt_err!("range() requires two numbers")
+                }
+            }
+
+            // ── Option / Result constructors ───────────────────────────────────
+            "Some" => {
+                Ok(Value::Some(Box::new(args.into_iter().next().unwrap_or(Value::Unit))))
+            }
+            "None" => {
+                Ok(Value::None)
+            }
+            "Ok" => {
+                Ok(Value::Ok(Box::new(args.into_iter().next().unwrap_or(Value::Unit))))
+            }
+            "Err" => {
+                Ok(Value::Err(Box::new(args.into_iter().next().unwrap_or(Value::Unit))))
+            }
+            "unwrap" => {
+                match args.first() {
+                    Some(Value::Some(v)) => Ok((**v).clone()),
+                    Some(Value::Ok(v)) => Ok((**v).clone()),
+                    Some(Value::None) => rt_err!("called unwrap() on None"),
+                    Some(Value::Err(e)) => rt_err!("called unwrap() on Err: {}", e),
+                    _ => rt_err!("unwrap() requires Option or Result")
+                }
+            }
+            "is_some" => {
+                match args.first() {
+                    Some(Value::Some(_)) => Ok(Value::Bool(true)),
+                    Some(Value::None) => Ok(Value::Bool(false)),
+                    _ => rt_err!("is_some() requires Option")
+                }
+            }
+            "is_none" => {
+                match args.first() {
+                    Some(Value::Some(_)) => Ok(Value::Bool(false)),
+                    Some(Value::None) => Ok(Value::Bool(true)),
+                    _ => rt_err!("is_none() requires Option")
+                }
+            }
+            "is_ok" => {
+                match args.first() {
+                    Some(Value::Ok(_)) => Ok(Value::Bool(true)),
+                    Some(Value::Err(_)) => Ok(Value::Bool(false)),
+                    _ => rt_err!("is_ok() requires Result")
+                }
+            }
+            "is_err" => {
+                match args.first() {
+                    Some(Value::Ok(_)) => Ok(Value::Bool(false)),
+                    Some(Value::Err(_)) => Ok(Value::Bool(true)),
+                    _ => rt_err!("is_err() requires Result")
+                }
+            }
+
+            // ── String functions ──────────────────────────────────────────────
+            "concat" => {
+                let strs: Vec<String> = args.iter()
+                    .map(|v| v.to_string())
+                    .collect();
+                Ok(Value::Str(strs.join("")))
+            }
+
+            // ── HashMap / Collection constructors ──────────────────────────────
+            "HashMap::new" => {
+                Ok(Value::HashMap(Arc::new(Mutex::new(HashMap::new()))))
+            }
+
+            // ── File I/O ───────────────────────────────────────────────────────
+            "read_file" => {
+                if let Some(Value::Str(path)) = args.first() {
+                    match std::fs::read_to_string(path) {
+                        Ok(content) => Ok(Value::Str(content)),
+                        Err(e) => rt_err!("read_file failed: {}", e)
+                    }
+                } else { rt_err!("read_file requires a path string") }
+            }
+            "write_file" => {
+                match (args.get(0), args.get(1)) {
+                    (Some(Value::Str(path)), Some(Value::Str(content))) => {
+                        match std::fs::write(path, content) {
+                            Ok(_) => Ok(Value::Bool(true)),
+                            Err(e) => rt_err!("write_file failed: {}", e)
+                        }
+                    }
+                    _ => rt_err!("write_file requires (path, content) strings")
+                }
+            }
+            "file_exists" => {
+                if let Some(Value::Str(path)) = args.first() {
+                    Ok(Value::Bool(std::path::Path::new(path).exists()))
+                } else { rt_err!("file_exists requires a path string") }
+            }
+            "delete_file" => {
+                if let Some(Value::Str(path)) = args.first() {
+                    match std::fs::remove_file(path) {
+                        Ok(_) => Ok(Value::Bool(true)),
+                        Err(e) => rt_err!("delete_file failed: {}", e)
+                    }
+                } else { rt_err!("delete_file requires a path string") }
+            }
+            "append_file" => {
+                match (args.get(0), args.get(1)) {
+                    (Some(Value::Str(path)), Some(Value::Str(content))) => {
+                        use std::io::Write;
+                        match std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                        {
+                            Ok(mut f) => {
+                                if f.write_all(content.as_bytes()).is_ok() {
+                                    Ok(Value::Bool(true))
+                                } else {
+                                    rt_err!("append_file write failed")
+                                }
+                            }
+                            Err(e) => rt_err!("append_file failed: {}", e)
+                        }
+                    }
+                    _ => rt_err!("append_file requires (path, content) strings")
+                }
+            }
+
+            // Not a built-in
+            _ => Err(RuntimeError {
+                message: format!("unknown function: {}", name),
+                span: None,
+            })
+        }
+    }
+
     // ── Built-in method dispatch ───────────────────────────────────────────
 
     fn eval_method(&mut self, recv: Value, method: &str, args: Vec<Value>)
@@ -1932,7 +2436,146 @@ impl Interpreter {
                     Ok(Value::Unit)
                 } else { unreachable!() }
             }
+            (Value::Array(_), "pop") => {
+                if let Value::Array(a) = recv {
+                    Ok(a.lock().unwrap().pop().unwrap_or(Value::Unit))
+                } else { unreachable!() }
+            }
+            (Value::Array(_), "clear") => {
+                if let Value::Array(a) = recv {
+                    a.lock().unwrap().clear();
+                    Ok(Value::Unit)
+                } else { unreachable!() }
+            }
+
+            // ── HashMap methods ───────────────────────────────────────────────
+            (Value::HashMap(_), "insert") => {
+                if let Value::HashMap(m) = recv {
+                    match (args.get(0), args.get(1)) {
+                        (Some(Value::Str(k)), Some(v)) => {
+                            m.lock().unwrap().insert(k.clone(), v.clone());
+                            Ok(Value::Unit)
+                        }
+                        _ => rt_err!("insert() requires (string_key, value)")
+                    }
+                } else { unreachable!() }
+            }
+            (Value::HashMap(_), "get") => {
+                if let Value::HashMap(m) = recv {
+                    if let Some(Value::Str(k)) = args.first() {
+                        let map = m.lock().unwrap();
+                        Ok(map.get(k).cloned().unwrap_or(Value::None))
+                    } else { rt_err!("get() requires string key") }
+                } else { unreachable!() }
+            }
+            (Value::HashMap(_), "remove") => {
+                if let Value::HashMap(m) = recv {
+                    if let Some(Value::Str(k)) = args.first() {
+                        Ok(m.lock().unwrap().remove(k).unwrap_or(Value::None))
+                    } else { rt_err!("remove() requires string key") }
+                } else { unreachable!() }
+            }
+            (Value::HashMap(_), "len") => {
+                if let Value::HashMap(m) = recv {
+                    Ok(Value::I32(m.lock().unwrap().len() as i32))
+                } else { unreachable!() }
+            }
+            (Value::HashMap(_), "clear") => {
+                if let Value::HashMap(m) = recv {
+                    m.lock().unwrap().clear();
+                    Ok(Value::Unit)
+                } else { unreachable!() }
+            }
+            (Value::HashMap(_), "keys") => {
+                if let Value::HashMap(m) = recv {
+                    let keys: Vec<Value> = m.lock().unwrap()
+                        .keys()
+                        .map(|k| Value::Str(k.clone()))
+                        .collect();
+                    Ok(Value::Array(Arc::new(Mutex::new(keys))))
+                } else { unreachable!() }
+            }
+            (Value::HashMap(_), "values") => {
+                if let Value::HashMap(m) = recv {
+                    let values: Vec<Value> = m.lock().unwrap()
+                        .values()
+                        .cloned()
+                        .collect();
+                    Ok(Value::Array(Arc::new(Mutex::new(values))))
+                } else { unreachable!() }
+            }
+            (Value::HashMap(_), "contains_key") => {
+                if let Value::HashMap(m) = recv {
+                    if let Some(Value::Str(k)) = args.first() {
+                        Ok(Value::Bool(m.lock().unwrap().contains_key(k)))
+                    } else { rt_err!("contains_key() requires string key") }
+                } else { unreachable!() }
+            }
             (Value::Str(s), "len") => Ok(Value::I32(s.len() as i32)),
+
+            // ── String methods ─────────────────────────────────────────────────
+            (Value::Str(s), "to_upper") => Ok(Value::Str(s.to_uppercase())),
+            (Value::Str(s), "to_lower") => Ok(Value::Str(s.to_lowercase())),
+            (Value::Str(s), "trim") => Ok(Value::Str(s.trim().to_string())),
+            (Value::Str(s), "trim_start") => Ok(Value::Str(s.trim_start().to_string())),
+            (Value::Str(s), "trim_end") => Ok(Value::Str(s.trim_end().to_string())),
+            (Value::Str(s), "chars") => {
+                let chars: Vec<Value> = s.chars()
+                    .map(|c| Value::Str(c.to_string()))
+                    .collect();
+                Ok(Value::Array(Arc::new(Mutex::new(chars))))
+            }
+            (Value::Str(s), "reverse") => {
+                Ok(Value::Str(s.chars().rev().collect()))
+            }
+            (Value::Str(s), "starts_with") => {
+                if let Some(Value::Str(prefix)) = args.first() {
+                    Ok(Value::Bool(s.starts_with(prefix)))
+                } else { rt_err!("starts_with() requires a string argument") }
+            }
+            (Value::Str(s), "ends_with") => {
+                if let Some(Value::Str(suffix)) = args.first() {
+                    Ok(Value::Bool(s.ends_with(suffix)))
+                } else { rt_err!("ends_with() requires a string argument") }
+            }
+            (Value::Str(s), "contains") => {
+                if let Some(Value::Str(needle)) = args.first() {
+                    Ok(Value::Bool(s.contains(needle)))
+                } else { rt_err!("contains() requires a string argument") }
+            }
+            (Value::Str(s), "split") => {
+                if let Some(Value::Str(delim)) = args.first() {
+                    let parts: Vec<Value> = s.split(delim.as_str())
+                        .map(|part| Value::Str(part.to_string()))
+                        .collect();
+                    Ok(Value::Array(Arc::new(Mutex::new(parts))))
+                } else { rt_err!("split() requires a string argument") }
+            }
+            (Value::Str(s), "replace") => {
+                match (args.get(0), args.get(1)) {
+                    (Some(Value::Str(from)), Some(Value::Str(to))) => {
+                        Ok(Value::Str(s.replace(from, to)))
+                    }
+                    _ => rt_err!("replace() requires two string arguments")
+                }
+            }
+
+            // ── Option/Result methods ───────────────────────────────────────────
+            (Value::Some(v), "unwrap") => Ok((**v).clone()),
+            (Value::None, "unwrap") => rt_err!("called unwrap() on None"),
+            (Value::Ok(v), "unwrap") => Ok((**v).clone()),
+            (Value::Err(e), "unwrap") => rt_err!("called unwrap() on Err: {}", e),
+
+            (Value::Some(_), "is_some") => Ok(Value::Bool(true)),
+            (Value::None, "is_some") => Ok(Value::Bool(false)),
+            (Value::Some(_), "is_none") => Ok(Value::Bool(false)),
+            (Value::None, "is_none") => Ok(Value::Bool(true)),
+
+            (Value::Ok(_), "is_ok") => Ok(Value::Bool(true)),
+            (Value::Err(_), "is_ok") => Ok(Value::Bool(false)),
+            (Value::Ok(_), "is_err") => Ok(Value::Bool(false)),
+            (Value::Err(_), "is_err") => Ok(Value::Bool(true)),
+
             // ── Fallback ───────────────────────────────────────────────────────
             (_, method) => {
                 rt_err!("no method `{method}` on `{}`", recv.type_name())
@@ -2321,6 +2964,10 @@ fn arith_f64(op: BinOpKind, a: f64, b: f64) -> Result<f64, RuntimeError> {
             a / b
         }
         BinOpKind::Rem => a % b,
+        BinOpKind::FloorDiv => {
+            if b == 0.0 { return rt_err!("floor division by zero"); }
+            (a / b).floor()
+        }
         _ => return rt_err!("operator {:?} not defined for floats", op),
     })
 }
@@ -2402,6 +3049,305 @@ fn title_case(s: &str) -> String {
     match c.next() {
         None    => String::new(),
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+    }
+}
+
+// =============================================================================
+// BROADCAST HELPERS (numpy-style)
+// =============================================================================
+
+/// Compute the broadcast result shape of two shapes. Returns None if incompatible.
+pub(crate) fn broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
+    let len = a.len().max(b.len());
+    let mut result = vec![0usize; len];
+    for i in 0..len {
+        let da = if i < len - a.len() { 1 } else { a[i - (len - a.len())] };
+        let db = if i < len - b.len() { 1 } else { b[i - (len - b.len())] };
+        result[i] = if da == db { da }
+                    else if da == 1 { db }
+                    else if db == 1 { da }
+                    else { return None; };
+    }
+    Some(result)
+}
+
+/// Map a flat linear index in `result_shape` back to a flat index in `src_shape`,
+/// respecting broadcast rules (dimensions of size 1 always map to index 0).
+pub(crate) fn broadcast_index(flat: usize, result_shape: &[usize], src_shape: &[usize]) -> usize {
+    let len = result_shape.len();
+    let off = len - src_shape.len();
+    let mut src_idx = 0usize;
+    let mut stride  = 1usize;
+    let mut rem     = flat;
+
+    // Decompose flat index into multi-dim, then re-compose for src.
+    let mut multi = vec![0usize; len];
+    for i in (0..len).rev() {
+        multi[i] = rem % result_shape[i];
+        rem      /= result_shape[i];
+    }
+
+    let mut src_strides = vec![1usize; src_shape.len()];
+    for i in (0..src_shape.len().saturating_sub(1)).rev() {
+        src_strides[i] = src_strides[i + 1] * src_shape[i + 1];
+    }
+
+    for i in 0..src_shape.len() {
+        let ri = i + off;
+        let idx = if src_shape[i] == 1 { 0 } else { multi[ri] };
+        src_idx += idx * src_strides[i];
+        let _ = stride;
+        stride = 1;
+    }
+    src_idx
+}
+
+// =============================================================================
+// VMAP  —  vectorise a closure over the batch (first) dimension
+// =============================================================================
+
+/// Apply a function to each slice along axis 0 of a tensor, collecting results.
+///
+/// If `input` has shape [B, ...], the function receives tensors of shape [...]
+/// and the output is stacked to [B, output_dims...].
+pub fn vmap_tensor<F>(input: &Tensor, f: F) -> Result<Tensor, RuntimeError>
+where
+    F: Fn(Tensor) -> Result<Tensor, RuntimeError>,
+{
+    if input.shape.is_empty() {
+        return Err(RuntimeError::new("vmap requires at least a 1-D tensor"));
+    }
+    let batch = input.shape[0];
+    let inner_shape = input.shape[1..].to_vec();
+    let inner_n: usize = inner_shape.iter().product::<usize>().max(1);
+    let data = input.cpu_data();
+
+    let mut outputs = Vec::with_capacity(batch);
+    for b in 0..batch {
+        let slice = data[b * inner_n..(b + 1) * inner_n].to_vec();
+        let t = Tensor::from_data(inner_shape.clone(), slice);
+        outputs.push(f(t)?);
+    }
+
+    // Stack: all outputs must have the same shape
+    let out_shape = outputs.first()
+        .map(|t| t.shape.clone())
+        .unwrap_or_default();
+    let out_n: usize = out_shape.iter().product::<usize>().max(1);
+    let mut stacked = Vec::with_capacity(batch * out_n);
+    for t in &outputs {
+        stacked.extend_from_slice(t.cpu_data());
+    }
+    let mut final_shape = vec![batch];
+    final_shape.extend(&out_shape);
+    Ok(Tensor::from_data(final_shape, stacked))
+}
+
+// =============================================================================
+// NOISE BUILTINS  (Perlin / value noise, no external crate)
+// =============================================================================
+
+/// Value noise in [0, 1] — cheap, no external dependency.
+pub fn value_noise_2d(x: f32, y: f32) -> f32 {
+    fn fade(t: f32) -> f32 { t * t * t * (t * (t * 6.0 - 15.0) + 10.0) }
+    fn lerp(a: f32, b: f32, t: f32) -> f32 { a + t * (b - a) }
+    fn hash(ix: i32, iy: i32) -> f32 {
+        let n = ix.wrapping_mul(1619).wrapping_add(iy.wrapping_mul(31337))
+            .wrapping_mul(1013904223i32);
+        (n as u32 as f32) / u32::MAX as f32
+    }
+
+    let ix = x.floor() as i32;
+    let iy = y.floor() as i32;
+    let fx = x - x.floor();
+    let fy = y - y.floor();
+    let ux = fade(fx);
+    let uy = fade(fy);
+
+    lerp(
+        lerp(hash(ix, iy),   hash(ix + 1, iy),   ux),
+        lerp(hash(ix, iy+1), hash(ix + 1, iy+1), ux),
+        uy,
+    )
+}
+
+/// White noise uniform in [0, 1].
+pub fn white_noise() -> f32 { pseudo_rand() }
+
+/// Fractional Brownian Motion — sum of octaves of value noise.
+pub fn fbm_2d(x: f32, y: f32, octaves: u32, lacunarity: f32, gain: f32) -> f32 {
+    let mut val = 0.0_f32;
+    let mut amp = 0.5_f32;
+    let mut freq = 1.0_f32;
+    for _ in 0..octaves {
+        val  += amp * value_noise_2d(x * freq, y * freq);
+        amp  *= gain;
+        freq *= lacunarity;
+    }
+    val
+}
+
+// =============================================================================
+// PPO  —  Proximal Policy Optimisation training loop helpers
+// =============================================================================
+
+/// Compute Generalised Advantage Estimation (GAE).
+///
+/// `rewards`, `values`, `dones` are all length T (timestep).
+/// Returns (advantages, returns) each of length T.
+pub fn gae(
+    rewards: &[f32],
+    values:  &[f32],
+    dones:   &[f32],  // 1.0 if episode ended, 0.0 otherwise
+    gamma:   f32,
+    lam:     f32,
+    last_value: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let t = rewards.len();
+    let mut advantages = vec![0.0_f32; t];
+    let mut last_gae   = 0.0_f32;
+    let mut next_val   = last_value;
+
+    for i in (0..t).rev() {
+        let mask  = 1.0 - dones[i];
+        let delta = rewards[i] + gamma * next_val * mask - values[i];
+        last_gae  = delta + gamma * lam * mask * last_gae;
+        advantages[i] = last_gae;
+        next_val = values[i];
+    }
+
+    let returns: Vec<f32> = advantages.iter().zip(values).map(|(a, v)| a + v).collect();
+    (advantages, returns)
+}
+
+/// PPO surrogate loss (clipped objective).
+///
+/// Returns (policy_loss, value_loss, entropy).
+pub fn ppo_loss(
+    log_probs_old: &[f32],
+    log_probs_new: &[f32],
+    advantages:    &[f32],
+    returns:       &[f32],
+    values:        &[f32],
+    clip_eps:      f32,
+    vf_coef:       f32,
+    ent_coef:      f32,
+    entropy:       &[f32],
+) -> (f32, f32, f32) {
+    let n = log_probs_old.len() as f32;
+
+    // Policy loss (clipped surrogate)
+    let policy_loss = log_probs_old.iter().zip(log_probs_new).zip(advantages)
+        .map(|((old, new), adv)| {
+            let ratio  = (new - old).exp();
+            let surr1  = ratio * adv;
+            let surr2  = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps) * adv;
+            -surr1.min(surr2)
+        })
+        .sum::<f32>() / n;
+
+    // Value function loss (MSE, clipped)
+    let value_loss = returns.iter().zip(values)
+        .map(|(r, v)| (r - v).powi(2))
+        .sum::<f32>() / n;
+
+    // Entropy bonus
+    let mean_entropy = entropy.iter().sum::<f32>() / n;
+
+    (
+        policy_loss + vf_coef * value_loss - ent_coef * mean_entropy,
+        value_loss,
+        mean_entropy,
+    )
+}
+
+// =============================================================================
+// SIMPLE PHYSICS STEP  (Feature 7 — game dev integration)
+// =============================================================================
+
+/// Rigid body state for a single entity.
+#[derive(Debug, Clone, Default)]
+pub struct RigidBody {
+    pub pos:      [f32; 3],
+    pub vel:      [f32; 3],
+    pub mass:     f32,
+    pub drag:     f32,        // linear damping coefficient
+    pub is_static: bool,
+}
+
+impl RigidBody {
+    pub fn new(mass: f32) -> Self {
+        RigidBody { mass, drag: 0.02, ..Default::default() }
+    }
+
+    /// Semi-implicit Euler integration.
+    pub fn integrate(&mut self, gravity: [f32; 3], dt: f32) {
+        if self.is_static { return; }
+        // a = F/m (gravity only here; external forces accumulated elsewhere)
+        for i in 0..3 {
+            self.vel[i] += gravity[i] * dt;
+            self.vel[i] *= 1.0 - self.drag * dt;
+            self.pos[i] += self.vel[i] * dt;
+        }
+    }
+
+    /// Apply an impulse directly to velocity: v += impulse / mass.
+    pub fn apply_impulse(&mut self, impulse: [f32; 3]) {
+        if self.is_static || self.mass == 0.0 { return; }
+        let inv_mass = 1.0 / self.mass;
+        for i in 0..3 { self.vel[i] += impulse[i] * inv_mass; }
+    }
+}
+
+/// Axis-aligned bounding box collider.
+#[derive(Debug, Clone)]
+pub struct AabbCollider {
+    pub half_extents: [f32; 3],
+}
+
+impl AabbCollider {
+    /// Test overlap of two AABBs at given positions.
+    pub fn overlaps(&self, pos_a: [f32; 3], other: &AabbCollider, pos_b: [f32; 3]) -> bool {
+        for i in 0..3 {
+            let dist = (pos_a[i] - pos_b[i]).abs();
+            if dist > self.half_extents[i] + other.half_extents[i] { return false; }
+        }
+        true
+    }
+
+    /// Compute penetration depth and normal for collision response.
+    pub fn penetration(
+        &self, pos_a: [f32; 3],
+        other: &AabbCollider, pos_b: [f32; 3],
+    ) -> Option<([f32; 3], f32)> {
+        let mut min_pen = f32::INFINITY;
+        let mut normal  = [0.0_f32; 3];
+        for i in 0..3 {
+            let delta  = pos_b[i] - pos_a[i];
+            let overlap = (self.half_extents[i] + other.half_extents[i]) - delta.abs();
+            if overlap <= 0.0 { return None; }
+            if overlap < min_pen {
+                min_pen = overlap;
+                normal  = [0.0; 3];
+                normal[i] = delta.signum();
+            }
+        }
+        Some((normal, min_pen))
+    }
+}
+
+/// Resolve elastic collision between two rigid bodies.
+pub fn resolve_collision(a: &mut RigidBody, b: &mut RigidBody, normal: [f32; 3], restitution: f32) {
+    let rel_vel: f32 = (0..3).map(|i| (a.vel[i] - b.vel[i]) * normal[i]).sum();
+    if rel_vel > 0.0 { return; } // separating
+
+    let inv_a = if a.is_static { 0.0 } else { 1.0 / a.mass };
+    let inv_b = if b.is_static { 0.0 } else { 1.0 / b.mass };
+    let j = -(1.0 + restitution) * rel_vel / (inv_a + inv_b);
+
+    for i in 0..3 {
+        a.vel[i] += j * inv_a * normal[i];
+        b.vel[i] -= j * inv_b * normal[i];
     }
 }
 

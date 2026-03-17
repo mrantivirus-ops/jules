@@ -247,6 +247,11 @@ impl Parser {
             TokenKind::KwAgent     => self.parse_agent(attrs).map(Item::Agent),
             TokenKind::KwModel     => self.parse_model(attrs).map(Item::Model),
             TokenKind::KwTrain     => self.parse_train(attrs).map(Item::Train),
+            TokenKind::KwShader    => self.parse_shader(attrs).map(Item::Shader),
+            TokenKind::KwScene     => self.parse_scene(attrs).map(Item::Scene),
+            TokenKind::KwPrefab    => self.parse_prefab(attrs).map(Item::Prefab),
+            TokenKind::KwPhysics   => self.parse_physics_config(attrs).map(Item::PhysicsConfig),
+            TokenKind::KwLoss      => self.parse_loss(attrs).map(Item::Loss),
             _ => Err(self.unexpected("expected item declaration")),
         }
     }
@@ -257,19 +262,22 @@ impl Parser {
         let mut attrs = Vec::new();
         loop {
             let attr = match &self.peek().kind {
-                TokenKind::AtGpu      => { self.advance(); Attribute::Gpu }
-                TokenKind::AtCpu      => { self.advance(); Attribute::Cpu }
-                TokenKind::AtTpu      => { self.advance(); Attribute::Tpu }
-                TokenKind::AtGrad     => { self.advance(); Attribute::Grad }
-                TokenKind::AtSimd     => { self.advance(); Attribute::Simd }
-                TokenKind::AtParallel => { self.advance(); Attribute::Parallel }
-                TokenKind::AtSeq      => { self.advance(); Attribute::Seq }
+                TokenKind::AtGpu        => { self.advance(); Attribute::Gpu }
+                TokenKind::AtCpu        => { self.advance(); Attribute::Cpu }
+                TokenKind::AtTpu        => { self.advance(); Attribute::Tpu }
+                TokenKind::AtGrad       => { self.advance(); Attribute::Grad }
+                TokenKind::AtSimd       => { self.advance(); Attribute::Simd }
+                TokenKind::AtParallel   => { self.advance(); Attribute::Parallel }
+                TokenKind::AtSeq        => { self.advance(); Attribute::Seq }
+                // Named annotations with optional args
                 TokenKind::AtKernel | TokenKind::AtInline | TokenKind::AtNoInline
-                | TokenKind::AtUnroll => {
-                    let name = format!("{:?}", self.peek().kind).to_lowercase()
-                        .trim_start_matches("at").to_owned();
+                | TokenKind::AtUnroll   | TokenKind::AtJit    | TokenKind::AtVmap
+                | TokenKind::AtCheckpoint | TokenKind::AtQuantize | TokenKind::AtPrune
+                | TokenKind::AtProfile  | TokenKind::AtTest   | TokenKind::AtBenchmark
+                | TokenKind::AtDeprecated => {
+                    let raw = format!("{:?}", self.peek().kind);
+                    let name = raw.trim_start_matches("At").to_lowercase();
                     self.advance();
-                    // Optional argument list: @inline(always)
                     let args = if self.is(&TokenKind::LParen) {
                         self.parse_call_args().unwrap_or_default()
                     } else { vec![] };
@@ -1128,7 +1136,9 @@ fn infix_bp(kind: &TokenKind) -> Option<(u8, u8)> {
 
         // Tensor-specific (tightest)
         TokenKind::MatMul | TokenKind::HadamardMul | TokenKind::HadamardDiv => Some((27, 28)),
-        TokenKind::StarStar => Some((29, 28)), // right-assoc power
+        TokenKind::KronProd | TokenKind::OuterProd => Some((27, 28)), // @@ ^*
+        TokenKind::FloorDiv  => Some((25, 26)),     // // same prec as / *
+        TokenKind::StarStar  => Some((29, 28)),     // right-assoc power
 
         _ => None,
     }
@@ -1254,8 +1264,17 @@ impl Parser {
                 span: full_span, lhs: Box::new(lhs), rhs: Box::new(rhs) }),
             TokenKind::TensorConcat=> Ok(Expr::TensorConcat {
                 span: full_span, lhs: Box::new(lhs), rhs: Box::new(rhs) }),
+            TokenKind::KronProd    => Ok(Expr::KronProd {
+                span: full_span, lhs: Box::new(lhs), rhs: Box::new(rhs) }),
+            TokenKind::OuterProd   => Ok(Expr::OuterProd {
+                span: full_span, lhs: Box::new(lhs), rhs: Box::new(rhs) }),
             TokenKind::StarStar    => Ok(Expr::Pow {
                 span: full_span, base: Box::new(lhs), exp: Box::new(rhs) }),
+            TokenKind::FloorDiv    => {
+                // Lower to BinOp::FloorDiv
+                Ok(Expr::BinOp { span: full_span, op: BinOpKind::FloorDiv,
+                                 lhs: Box::new(lhs), rhs: Box::new(rhs) })
+            }
 
             // Normal arithmetic / logical / comparison
             _ => {
@@ -1850,7 +1869,27 @@ impl Parser {
             // Sub-model reference by name
             TokenKind::Ident(name) => {
                 let name = name.clone();
+                let nspan = self.current_span();
                 self.advance();
+                // `residual { … }` sub-block
+                if name == "residual" && self.is(&TokenKind::LBrace) {
+                    self.expect(&TokenKind::LBrace)?;
+                    let mut inner = Vec::new();
+                    while !self.is(&TokenKind::RBrace) && !self.at_eof() {
+                        match self.parse_model_layer() {
+                            Ok(l)  => inner.push(l),
+                            Err(e) => self.recover(e),
+                        }
+                        self.eat(&TokenKind::Semicolon);
+                        self.eat(&TokenKind::Comma);
+                    }
+                    self.expect(&TokenKind::RBrace)?;
+                    return Ok(ModelLayer::Residual { span: nspan, inner });
+                }
+                // `flatten` — collapse spatial dims
+                if name == "flatten" {
+                    return Ok(ModelLayer::Flatten { span: nspan });
+                }
                 Ok(ModelLayer::SubModel { span, name })
             }
             other => Err(ParseError::new(span,
@@ -1942,6 +1981,8 @@ impl Parser {
         let mut model     = None;
         let mut optimizer = None;
         let mut hyper     = Vec::new();
+        let mut algorithm = None;
+        let mut value_model = None;
 
         while !self.is(&TokenKind::RBrace) && !self.at_eof() {
             match self.peek().kind.clone() {
@@ -1963,12 +2004,24 @@ impl Parser {
                 }
                 TokenKind::KwModel => {
                     self.advance();
-                    model = Some(self.expect_ident()?.1);
+                    if matches!(&self.peek().kind, TokenKind::Ident(s) if s == "value") {
+                        self.advance(); // consume "value"
+                        value_model = Some(self.expect_ident()?.1);
+                    } else {
+                        model = Some(self.expect_ident()?.1);
+                    }
                 }
                 TokenKind::Ident(key) if key == "optimizer" => {
                     self.advance();
                     self.eat(&TokenKind::Colon);
                     optimizer = Some(self.parse_optimizer_spec(start)?);
+                }
+                // `algorithm: ppo | dqn | sac | reinforce`
+                TokenKind::Ident(key) if key == "algorithm" => {
+                    self.advance();
+                    self.eat(&TokenKind::Colon);
+                    let (_, alg_name) = self.expect_name()?;
+                    algorithm = Some(alg_name);
                 }
                 // hyper-parameter: key = value
                 TokenKind::Ident(key) => {
@@ -1985,7 +2038,7 @@ impl Parser {
         }
 
         let end = self.expect(&TokenKind::RBrace)?;
-        Ok(TrainDecl { span: start.merge(end), attrs, agent, world, signals, episode, model, optimizer, hyper })
+        Ok(TrainDecl { span: start.merge(end), attrs, agent, world, signals, episode, model, optimizer, hyper, algorithm, value_model })
     }
 
     fn parse_episode_spec(&mut self) -> ParseResult<EpisodeSpec> {
@@ -2026,6 +2079,9 @@ impl Parser {
             "rmsprop" => OptimizerKind::Rmsprop,
             "adagrad" => OptimizerKind::Adagrad,
             "adamw"   => OptimizerKind::AdamW,
+            "lion"    => OptimizerKind::Lion,
+            "sophia"  => OptimizerKind::Sophia,
+            "prodigy" => OptimizerKind::Prodigy,
             _         => OptimizerKind::Adam,
         };
         let mut lr    = 3e-4;
@@ -2051,7 +2107,189 @@ impl Parser {
 }
 
 // =============================================================================
-// §13  TESTS
+// §13  SHADER / SCENE / PREFAB / PHYSICS / LOSS  (new top-level items)
+// =============================================================================
+
+impl Parser {
+    // ── shader Name { vertex { … } fragment { … } compute { … } } ────────────
+    fn parse_shader(&mut self, attrs: Vec<Attribute>) -> ParseResult<ShaderDecl> {
+        let start = self.expect(&TokenKind::KwShader)?;
+        let (_, name) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+
+        let mut bindings = Vec::new();
+        let mut vertex_body   = None;
+        let mut fragment_body = None;
+        let mut compute_body  = None;
+
+        while !self.is(&TokenKind::RBrace) && !self.at_eof() {
+            match self.peek().kind.clone() {
+                // Uniform / buffer / sampler / texture bindings
+                TokenKind::KwUniform | TokenKind::KwBuffer
+                | TokenKind::KwSampler | TokenKind::KwTexture => {
+                    let bkind_tok = self.advance().kind.clone();
+                    let (bspan, bname) = self.expect_ident()?;
+                    self.eat(&TokenKind::Colon);
+                    let bty = self.parse_type()?;
+                    // Optional binding index: @binding(0)
+                    let binding_idx = if let TokenKind::AtKernel = self.peek().kind.clone() {
+                        None
+                    } else if self.is(&TokenKind::Hash) {
+                        self.advance();
+                        self.expect_u64().ok()
+                    } else { None };
+                    let bkind = match bkind_tok {
+                        TokenKind::KwUniform => ShaderBindingKind::Uniform,
+                        TokenKind::KwBuffer  => ShaderBindingKind::Storage,
+                        TokenKind::KwSampler => ShaderBindingKind::Sampler,
+                        TokenKind::KwTexture => ShaderBindingKind::Texture,
+                        _ => ShaderBindingKind::Uniform,
+                    };
+                    bindings.push(ShaderBinding { span: bspan, name: bname, ty: bty, kind: bkind, index: binding_idx });
+                    self.eat(&TokenKind::Semicolon);
+                    self.eat(&TokenKind::Comma);
+                }
+                TokenKind::KwVertex   => {
+                    self.advance();
+                    vertex_body = Some(self.parse_block()?);
+                }
+                TokenKind::KwFragment => {
+                    self.advance();
+                    fragment_body = Some(self.parse_block()?);
+                }
+                TokenKind::KwCompute  => {
+                    self.advance();
+                    compute_body = Some(self.parse_block()?);
+                }
+                _ => { self.advance(); }
+            }
+        }
+
+        let end = self.expect(&TokenKind::RBrace)?;
+        Ok(ShaderDecl {
+            span: start.merge(end),
+            attrs, name, bindings,
+            vertex_body, fragment_body, compute_body,
+        })
+    }
+
+    // ── scene Name { instantiate Prefab, … } ─────────────────────────────────
+    fn parse_scene(&mut self, attrs: Vec<Attribute>) -> ParseResult<SceneDecl> {
+        let start = self.expect(&TokenKind::KwScene)?;
+        let (_, name) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut instances = Vec::new();
+
+        while !self.is(&TokenKind::RBrace) && !self.at_eof() {
+            let ispan = self.current_span();
+            // `PrefabName { field: val, … }` or just `PrefabName`
+            let (_, prefab_name) = self.expect_ident()?;
+            let overrides = if self.is(&TokenKind::LBrace) {
+                self.parse_struct_fields_values()?
+            } else { vec![] };
+            instances.push(SceneInstance { span: ispan, prefab: prefab_name, overrides });
+            self.eat(&TokenKind::Comma);
+            self.eat(&TokenKind::Semicolon);
+        }
+
+        let end = self.expect(&TokenKind::RBrace)?;
+        Ok(SceneDecl { span: start.merge(end), attrs, name, instances })
+    }
+
+    // ── prefab Name { component Component, … } ────────────────────────────────
+    fn parse_prefab(&mut self, attrs: Vec<Attribute>) -> ParseResult<PrefabDecl> {
+        let start = self.expect(&TokenKind::KwPrefab)?;
+        let (_, name) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut components = Vec::new();
+
+        while !self.is(&TokenKind::RBrace) && !self.at_eof() {
+            let cspan = self.current_span();
+            let (_, cname) = self.expect_ident()?;
+            let fields = if self.is(&TokenKind::LBrace) {
+                self.parse_struct_fields_values()?
+            } else { vec![] };
+            components.push(PrefabComponent { span: cspan, name: cname, fields });
+            self.eat(&TokenKind::Comma);
+            self.eat(&TokenKind::Semicolon);
+        }
+
+        let end = self.expect(&TokenKind::RBrace)?;
+        Ok(PrefabDecl { span: start.merge(end), attrs, name, components })
+    }
+
+    // ── physics { gravity: vec3(0,-9.8,0), iterations: 10, … } ──────────────
+    fn parse_physics_config(&mut self, attrs: Vec<Attribute>) -> ParseResult<PhysicsConfig> {
+        let start = self.expect(&TokenKind::KwPhysics)?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut gravity = None;
+        let mut iterations = None;
+        let mut substeps = None;
+        let mut collision_layers = Vec::new();
+
+        while !self.is(&TokenKind::RBrace) && !self.at_eof() {
+            let (_, key) = self.expect_name().unwrap_or((Span::dummy(), String::new()));
+            self.eat(&TokenKind::Colon);
+            match key.as_str() {
+                "gravity"    => { gravity    = Some(self.parse_expr(0)?); }
+                "iterations" => { iterations = self.expect_u64().ok(); }
+                "substeps"   => { substeps   = self.expect_u64().ok(); }
+                "layer"      => {
+                    let (_, lname) = self.expect_ident().unwrap_or((Span::dummy(), String::new()));
+                    collision_layers.push(lname);
+                }
+                _ => { let _ = self.parse_expr(0); }
+            }
+            self.eat(&TokenKind::Comma);
+            self.eat(&TokenKind::Semicolon);
+        }
+
+        let end = self.expect(&TokenKind::RBrace)?;
+        Ok(PhysicsConfig { span: start.merge(end), attrs, gravity, iterations, substeps, collision_layers })
+    }
+
+    // ── loss LossName { fn forward(pred, target) -> f32 { … } } ─────────────
+    fn parse_loss(&mut self, attrs: Vec<Attribute>) -> ParseResult<LossDecl> {
+        let start = self.expect(&TokenKind::KwLoss)?;
+        let (_, name) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut methods = Vec::new();
+
+        while !self.is(&TokenKind::RBrace) && !self.at_eof() {
+            match self.peek().kind.clone() {
+                TokenKind::KwFn | TokenKind::KwAsync => {
+                    let fn_attrs = self.parse_attrs();
+                    match self.parse_fn(fn_attrs) {
+                        Ok(f)  => methods.push(f),
+                        Err(e) => self.recover(e),
+                    }
+                }
+                _ => { self.advance(); }
+            }
+        }
+
+        let end = self.expect(&TokenKind::RBrace)?;
+        Ok(LossDecl { span: start.merge(end), attrs, name, methods })
+    }
+
+    // ── helper: parse `{ key: expr, … }` field-value pairs ───────────────────
+    fn parse_struct_fields_values(&mut self) -> ParseResult<Vec<(String, Expr)>> {
+        self.expect(&TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        while !self.is(&TokenKind::RBrace) && !self.at_eof() {
+            let (_, fname) = self.expect_name()?;
+            self.expect(&TokenKind::Colon)?;
+            let fval = self.parse_expr(0)?;
+            fields.push((fname, fval));
+            if !self.eat(&TokenKind::Comma) { break; }
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(fields)
+    }
+}
+
+// =============================================================================
+// §14  TESTS
 // =============================================================================
 
 #[cfg(test)]

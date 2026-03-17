@@ -137,6 +137,8 @@ pub enum Type {
     Ref { mutable: bool, inner: Box<Type> },
     /// `Option<T>`
     Option(Box<Type>),
+    /// `Result<T, E>`
+    Result { ok: Box<Type>, err: Box<Type> },
     /// `fn(A, B) -> C`
     FnPtr { params: Vec<Type>, ret: Box<Type> },
     /// The never / bottom type `!`

@@ -299,6 +299,7 @@ struct DeclRecord {
     span:       Span,
     use_count:  u32,
     kind:       DeclKind,
+    deprecated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +312,11 @@ enum DeclKind {
     Agent,
     Model,
     Const,
+    Shader,
+    Scene,
+    Prefab,
+    Loss,
+    PhysicsConfig,
 }
 
 #[derive(Debug, Default)]
@@ -320,7 +326,15 @@ struct DeclRegistry {
 
 impl DeclRegistry {
     fn register(&mut self, name: impl Into<String>, span: Span, kind: DeclKind) {
-        self.records.insert(name.into(), DeclRecord { span, use_count: 0, kind });
+        self.records.insert(name.into(), DeclRecord { span, use_count: 0, kind, deprecated: false });
+    }
+
+    fn register_deprecated(&mut self, name: impl Into<String>, span: Span, kind: DeclKind) {
+        self.records.insert(name.into(), DeclRecord { span, use_count: 0, kind, deprecated: true });
+    }
+
+    fn is_deprecated(&self, name: &str) -> bool {
+        self.records.get(name).map_or(false, |r| r.deprecated)
     }
 
     fn mark_used(&mut self, name: &str) {

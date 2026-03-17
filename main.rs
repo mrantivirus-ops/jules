@@ -51,6 +51,9 @@ pub fn jules_check(filename: &str, source: &str) -> Vec<Diag> {
 
 /// Load, analyse, and run a Jules source file.  Returns `Ok(())` on success,
 /// or the first runtime error as a `String`.
+///
+/// Pass `entry = "main"` for normal execution, `"#test"` to run all @test
+/// functions, or `"#bench"` to run all @benchmark functions.
 pub fn jules_run_file(path: &str, entry: &str) -> Result<(), String> {
     let source = fs::read_to_string(path)
         .map_err(|e| format!("cannot read `{path}`: {e}"))?;
@@ -387,6 +390,15 @@ impl CompileUnit {
     }
 
     pub fn error_count(&self)   -> usize { self.diags.iter().filter(|d| d.is_error()).count() }
+
+    /// Human-readable one-line summary: "2 errors, 1 warning".
+    pub fn summary(&self) -> String {
+        let e = self.error_count();
+        let w = self.warning_count();
+        format!("{} error{}, {} warning{}",
+            e, if e == 1 { "" } else { "s" },
+            w, if w == 1 { "" } else { "s" })
+    }
     pub fn warning_count(&self) -> usize {
         self.diags.iter().filter(|d| d.severity == DiagSeverity::Warning).count()
     }
@@ -396,10 +408,12 @@ impl CompileUnit {
 pub struct Pipeline {
     pub warn_as_error: bool,
     pub quiet:         bool,
+    pub emit_ir:       bool,
+    pub profile:       bool,
 }
 
 impl Pipeline {
-    pub fn new() -> Self { Pipeline { warn_as_error: false, quiet: false } }
+    pub fn new() -> Self { Pipeline { warn_as_error: false, quiet: false, emit_ir: false, profile: false } }
 
     /// Run the pipeline as far as possible, accumulating diagnostics.
     /// Returns `Ok(unit)` even when there are errors so the caller can
@@ -463,6 +477,23 @@ impl Pipeline {
             unit.diags.retain(|d| d.severity == DiagSeverity::Error);
         }
 
+        // Emit summary counts.
+        if !self.quiet {
+            let ec = unit.error_count();
+            let wc = unit.warning_count();
+            if ec > 0 || wc > 0 {
+                let summary = format!(
+                    "compilation finished: {} error{}, {} warning{}",
+                    ec, if ec == 1 { "" } else { "s" },
+                    wc, if wc == 1 { "" } else { "s" },
+                );
+                unit.diags.push(Diag::note(
+                    Span::dummy(),
+                    summary,
+                ));
+            }
+        }
+
         PipelineResult::Ok(program)
     }
 }
@@ -474,7 +505,7 @@ pub enum PipelineResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PassName { Lex, Parse, TypeCheck, Sema, Interp }
+pub enum PassName { Lex, Parse, TypeCheck, Sema, Interp, Optimize, Codegen }
 
 // ── Diagnostic adapters (one per pass module) ──────────────────────────────
 

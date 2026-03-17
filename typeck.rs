@@ -974,6 +974,66 @@ impl TypeCk {
             Expr::TensorConcat { span, lhs, rhs } =>
                 self.check_tensor_concat(*span, lhs, rhs, env),
 
+            // ── Kronecker product A @@ B → [m*p, n*q] where A:[m,n] B:[p,q] ──
+            Expr::KronProd { span, lhs, rhs } => {
+                let l = self.check_expr(lhs, env);
+                let r = self.check_expr(rhs, env);
+                if let (Ty::Tensor { elem: ea, shape: sa },
+                        Ty::Tensor { elem: eb, shape: sb }) = (&l, &r) {
+                    if ea != eb {
+                        self.diag.error(*span, "Kronecker product: element type mismatch");
+                    }
+                    if sa.len() != 2 || sb.len() != 2 {
+                        self.diag.error(*span, "Kronecker product (`@@`) requires 2-D tensors");
+                        return self.infer.fresh();
+                    }
+                    let d0 = match (&sa[0], &sb[0]) {
+                        (Dim::Lit(a), Dim::Lit(b)) => Dim::Lit(a * b),
+                        _ => Dim::Dynamic,
+                    };
+                    let d1 = match (&sa[1], &sb[1]) {
+                        (Dim::Lit(a), Dim::Lit(b)) => Dim::Lit(a * b),
+                        _ => Dim::Dynamic,
+                    };
+                    return Ty::Tensor { elem: ea.clone(), shape: vec![d0, d1] };
+                }
+                self.diag.error(*span, format!(
+                    "`@@` (Kronecker product) requires 2-D tensor operands; got `{}` and `{}`",
+                    l.display(), r.display()
+                ));
+                self.infer.fresh()
+            }
+
+            // ── Outer product a ^* b → [m, n] where a:[m] b:[n] ──────────────
+            Expr::OuterProd { span, lhs, rhs } => {
+                let l = self.check_expr(lhs, env);
+                let r = self.check_expr(rhs, env);
+                let (elem, d0, d1) = match (&l, &r) {
+                    (Ty::Tensor { elem: ea, shape: sa },
+                     Ty::Tensor { elem: eb, shape: sb })
+                        if ea == eb && sa.len() == 1 && sb.len() == 1 =>
+                    {
+                        (ea.clone(), sa[0].clone(), sb[0].clone())
+                    }
+                    (Ty::Vec { family: fa, size: sa }, Ty::Vec { family: fb, size: sb })
+                        if fa == fb =>
+                    {
+                        let elem = if *fa == VecFamily::Float { ElemType::F32 } else { ElemType::I32 };
+                        let m = sa.lanes() as u64;
+                        let n = sb.lanes() as u64;
+                        return Ty::Tensor { elem, shape: vec![Dim::Lit(m), Dim::Lit(n)] };
+                    }
+                    _ => {
+                        self.diag.error(*span, format!(
+                            "`^*` (outer product) requires 1-D tensor or vector operands; got `{}` and `{}`",
+                            l.display(), r.display()
+                        ));
+                        return self.infer.fresh();
+                    }
+                };
+                Ty::Tensor { elem, shape: vec![d0, d1] }
+            }
+
             Expr::Grad { span, inner } => {
                 let ty = self.check_expr(inner, env);
                 if !ty.supports_grad() {
@@ -1158,7 +1218,8 @@ impl TypeCk {
             }
 
             // Arithmetic
-            BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul | BinOpKind::Div | BinOpKind::Rem => {
+            BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul
+            | BinOpKind::Div | BinOpKind::Rem | BinOpKind::FloorDiv => {
                 // Vector × scalar or scalar × vector
                 if let (Ty::Vec { size, family }, ref rty) | (ref rty, Ty::Vec { size, family }) = (&l, &r) {
                     let size = *size; let family = *family;
@@ -1301,7 +1362,7 @@ impl TypeCk {
     }
 
     /// `A .* B` or `A ./ B` — element-wise (Hadamard) multiply/divide.
-    /// Both operands must have the same type (tensor or vec).
+    /// Supports numpy-style broadcasting: [3,1] .* [1,4] → [3,4].
     fn check_hadamard(
         &mut self,
         span: Span,
@@ -1320,6 +1381,30 @@ impl TypeCk {
             ));
             return self.infer.fresh();
         }
+
+        // Numpy-style broadcasting for tensors
+        if let (Ty::Tensor { elem: ea, shape: sa }, Ty::Tensor { elem: eb, shape: sb }) = (&l, &r) {
+            if ea != eb {
+                self.diag.error(span, format!(
+                    "Hadamard operator: element type mismatch `{}` vs `{}`",
+                    l.display(), r.display()
+                ));
+                return self.infer.fresh();
+            }
+            // Broadcast: align from the right, check compatibility
+            let result_shape = broadcast_shapes(sa, sb);
+            match result_shape {
+                Some(shape) => return Ty::Tensor { elem: ea.clone(), shape },
+                None => {
+                    self.diag.error(span, format!(
+                        "cannot broadcast tensor shapes {:?} and {:?}",
+                        sa, sb
+                    ));
+                    return self.infer.fresh();
+                }
+            }
+        }
+
         if !self.infer.unify(&l, &r) {
             self.diag.error(span, format!(
                 "Hadamard operator: operand type mismatch `{}` vs `{}`",
@@ -2086,13 +2171,55 @@ fn eval_const_expr(expr: &Expr) -> Option<u64> {
                 BinOpKind::Add => Some(l + r),
                 BinOpKind::Sub => l.checked_sub(r),
                 BinOpKind::Mul => Some(l * r),
-                BinOpKind::Div => if r != 0 { Some(l / r) } else { None },
+                BinOpKind::Div | BinOpKind::FloorDiv => if r != 0 { Some(l / r) } else { None },
                 _ => None,
             }
         }
         _ => None,
     }
 }
+
+// =============================================================================
+// UTILITY — numpy-style broadcast shape computation
+// =============================================================================
+
+/// Compute the broadcast result shape of two tensor shapes (numpy rules).
+///
+/// Shapes are compared right-to-left. Each pair of dimensions must be either:
+///   • equal, or
+///   • one of them is 1 (broadcastable), or
+///   • one of them is Dynamic (result is Dynamic).
+///
+/// Returns `None` if the shapes are incompatible.
+fn broadcast_shapes(a: &[Dim], b: &[Dim]) -> Option<Vec<Dim>> {
+    let len = a.len().max(b.len());
+    let mut result = Vec::with_capacity(len);
+
+    let pad_a = len - a.len();
+    let pad_b = len - b.len();
+
+    for i in 0..len {
+        let da = if i < pad_a { &Dim::Lit(1) } else { &a[i - pad_a] };
+        let db = if i < pad_b { &Dim::Lit(1) } else { &b[i - pad_b] };
+
+        let out = match (da, db) {
+            (Dim::Dynamic, _) | (_, Dim::Dynamic) => Dim::Dynamic,
+            (Dim::Named(_), _) | (_, Dim::Named(_)) => Dim::Dynamic,
+            (Dim::Lit(x), Dim::Lit(y)) => {
+                if x == y {
+                    Dim::Lit(*x)
+                } else if *x == 1 {
+                    Dim::Lit(*y)
+                } else if *y == 1 {
+                    Dim::Lit(*x)
+                } else {
+                    return None; // incompatible
+                }
+            }
+        };
+        result.push(out);
+    }
+    Some(result)
 
 // =============================================================================
 // CONVENIENCE: top-level entry point

@@ -145,6 +145,77 @@ pub enum TokenKind {
     /// `without` — exclusion filter: `for e in world without (Dead,)`
     KwWithout,
 
+    // ── Shader / graphics pipeline (Feature 5) ───────────────────────────
+    /// `shader`      — declares a GPU shader program (vertex/fragment/compute)
+    KwShader,
+    /// `vertex`      — vertex shader stage block
+    KwVertex,
+    /// `fragment`    — fragment (pixel) shader stage block
+    KwFragment,
+    /// `compute`     — compute shader stage block
+    KwCompute,
+    /// `buffer`      — GPU storage/vertex buffer binding
+    KwBuffer,
+    /// `uniform`     — uniform / constant buffer binding
+    KwUniform,
+    /// `sampler`     — texture sampler descriptor
+    KwSampler,
+    /// `texture`     — texture resource (2D / cube / array)
+    KwTexture,
+    /// `pipeline`    — graphics or compute pipeline descriptor
+    KwPipeline,
+    /// `pass`        — render pass (attachments + clear values)
+    KwPass,
+    /// `layout`      — pipeline layout (bind groups, push constants)
+    KwLayout,
+
+    // ── Scene / asset / prefab (Feature 6) ───────────────────────────────
+    /// `scene`       — declares a named game scene / level
+    KwScene,
+    /// `prefab`      — reusable entity template
+    KwPrefab,
+    /// `asset`       — asset reference (mesh, texture, audio, …)
+    KwAsset,
+    /// `lod`         — level-of-detail configuration block
+    KwLod,
+
+    // ── Physics (Feature 7) ───────────────────────────────────────────────
+    /// `collider`    — physics collider shape declaration
+    KwCollider,
+    /// `rigidbody`   — physics rigid body component
+    KwRigidbody,
+    /// `constraint`  — physics joint / constraint (spring, hinge, …)
+    KwConstraint,
+    /// `trigger`     — trigger volume (overlap events, no collision response)
+    KwTrigger,
+    /// `physics`     — physics world configuration block
+    KwPhysics,
+
+    // ── ML / data pipeline (Feature 8) ───────────────────────────────────
+    /// `loss`        — declares a named loss function
+    KwLoss,
+    /// `metric`      — declares an evaluation metric
+    KwMetric,
+    /// `dataloader`  — dataset iteration handle
+    KwDataloader,
+    /// `transform`   — data preprocessing / augmentation transform
+    KwTransform,
+    /// `vmap`        — vectorised-map: lift fn over batch dimension (JAX-style)
+    KwVmap,
+    /// `jit`         — just-in-time compile a function
+    KwJit,
+    /// `quantize`    — post-training quantisation block
+    KwQuantize,
+    /// `prune`       — structured / unstructured weight pruning block
+    KwPrune,
+    /// `noise`       — procedural noise function (perlin, simplex, white)
+    KwNoise,
+    /// `shuffle`     — shuffle tensor / dataset along an axis
+    KwShuffle,
+    /// `checkpoint`  — save / restore a model or training state
+    KwCheckpoint,
+    /// `pipeline` (ML) — data or model pipeline (reuses KwPipeline above)
+
     // ── AI behavior system keywords (Feature 3) ──────────────────────────
     /// `agent`       — declares an AI behaviour agent
     KwAgent,
@@ -250,14 +321,23 @@ pub enum TokenKind {
     AtGpu,
     AtCpu,
     AtTpu,
-    AtGrad,     // @grad    — gradient annotation
-    AtSimd,     // @simd    — force SIMD vectorisation
-    AtParallel, // @parallel — force parallel (multi-thread) dispatch
-    AtSeq,      // @seq     — force sequential (deterministic) execution
-    AtUnroll,   // @unroll  — hint to unroll the next loop
-    AtInline,   // @inline  — force inlining of a function
-    AtNoInline, // @noinline — prevent inlining
-    AtKernel,   // @kernel  — mark function as GPU kernel entry point
+    AtGrad,        // @grad        — gradient annotation
+    AtSimd,        // @simd        — force SIMD vectorisation
+    AtParallel,    // @parallel    — force parallel (multi-thread) dispatch
+    AtSeq,         // @seq         — force sequential (deterministic) execution
+    AtUnroll,      // @unroll      — hint to unroll the next loop
+    AtInline,      // @inline      — force inlining of a function
+    AtNoInline,    // @noinline    — prevent inlining
+    AtKernel,      // @kernel      — GPU kernel entry point
+    AtJit,         // @jit         — JIT-compile this function
+    AtVmap,        // @vmap        — vectorise over batch dimension
+    AtCheckpoint,  // @checkpoint  — gradient checkpointing (recompute in backward)
+    AtQuantize,    // @quantize    — annotate for post-training quantisation
+    AtPrune,       // @prune       — annotate for weight pruning
+    AtProfile,     // @profile     — emit profiling instrumentation
+    AtTest,        // @test        — mark function as a unit test
+    AtBenchmark,   // @benchmark   — mark function as a microbenchmark
+    AtDeprecated,  // @deprecated  — emit deprecation warning at call sites
 
     // ── Operators ─────────────────────────────────────────────────────────
 
@@ -270,10 +350,13 @@ pub enum TokenKind {
     StarStar,    // ** (scalar power)
 
     // Tensor-specific operators
-    MatMul,      // @   — matrix multiply
-    HadamardMul, // .*  — element-wise multiply
-    HadamardDiv, // ./  — element-wise divide
-    TensorConcat,// ++  — tensor concatenation along first axis
+    MatMul,       // @    — matrix multiply (A @ B)
+    HadamardMul,  // .*   — element-wise multiply
+    HadamardDiv,  // ./   — element-wise divide
+    TensorConcat, // ++   — tensor concatenation along first axis
+    KronProd,     // @@   — Kronecker product  (A @@ B)
+    OuterProd,    // ^*   — outer product      (a ^* b)
+    FloorDiv,     // //   — floor (integer) division
 
     // Bitwise
     Ampersand,   // &
@@ -500,7 +583,44 @@ fn keyword(s: &str) -> Option<TokenKind> {
         "bool"     => TokenKind::KwBool,
         "usize"    => TokenKind::KwUsize,
 
-        // Control flow
+        // ── Shader / graphics ──────────────────────────────────────────────
+        "shader"     => TokenKind::KwShader,
+        "vertex"     => TokenKind::KwVertex,
+        "fragment"   => TokenKind::KwFragment,
+        "compute"    => TokenKind::KwCompute,
+        "buffer"     => TokenKind::KwBuffer,
+        "uniform"    => TokenKind::KwUniform,
+        "sampler"    => TokenKind::KwSampler,
+        "texture"    => TokenKind::KwTexture,
+        "pipeline"   => TokenKind::KwPipeline,
+        "pass"       => TokenKind::KwPass,
+        "layout"     => TokenKind::KwLayout,
+
+        // ── Scene / asset ──────────────────────────────────────────────────
+        "scene"      => TokenKind::KwScene,
+        "prefab"     => TokenKind::KwPrefab,
+        "asset"      => TokenKind::KwAsset,
+        "lod"        => TokenKind::KwLod,
+
+        // ── Physics ────────────────────────────────────────────────────────
+        "collider"   => TokenKind::KwCollider,
+        "rigidbody"  => TokenKind::KwRigidbody,
+        "constraint" => TokenKind::KwConstraint,
+        "trigger"    => TokenKind::KwTrigger,
+        "physics"    => TokenKind::KwPhysics,
+
+        // ── ML / data pipeline ─────────────────────────────────────────────
+        "loss"       => TokenKind::KwLoss,
+        "metric"     => TokenKind::KwMetric,
+        "dataloader" => TokenKind::KwDataloader,
+        "transform"  => TokenKind::KwTransform,
+        "vmap"       => TokenKind::KwVmap,
+        "jit"        => TokenKind::KwJit,
+        "quantize"   => TokenKind::KwQuantize,
+        "prune"      => TokenKind::KwPrune,
+        "noise"      => TokenKind::KwNoise,
+        "shuffle"    => TokenKind::KwShuffle,
+        "checkpoint" => TokenKind::KwCheckpoint,
         "if"       => TokenKind::KwIf,
         "else"     => TokenKind::KwElse,
         "for"      => TokenKind::KwFor,
@@ -918,17 +1038,26 @@ impl<'src> Lexer<'src> {
         }
         let span = self.span_from(start, line, col);
         let kind = match name.as_str() {
-            "gpu"      => TokenKind::AtGpu,
-            "cpu"      => TokenKind::AtCpu,
-            "tpu"      => TokenKind::AtTpu,
-            "grad"     => TokenKind::AtGrad,
-            "simd"     => TokenKind::AtSimd,
-            "parallel" => TokenKind::AtParallel,
-            "seq"      => TokenKind::AtSeq,
-            "unroll"   => TokenKind::AtUnroll,
-            "inline"   => TokenKind::AtInline,
-            "noinline" => TokenKind::AtNoInline,
-            "kernel"   => TokenKind::AtKernel,
+            "gpu"         => TokenKind::AtGpu,
+            "cpu"         => TokenKind::AtCpu,
+            "tpu"         => TokenKind::AtTpu,
+            "grad"        => TokenKind::AtGrad,
+            "simd"        => TokenKind::AtSimd,
+            "parallel"    => TokenKind::AtParallel,
+            "seq"         => TokenKind::AtSeq,
+            "unroll"      => TokenKind::AtUnroll,
+            "inline"      => TokenKind::AtInline,
+            "noinline"    => TokenKind::AtNoInline,
+            "kernel"      => TokenKind::AtKernel,
+            "jit"         => TokenKind::AtJit,
+            "vmap"        => TokenKind::AtVmap,
+            "checkpoint"  => TokenKind::AtCheckpoint,
+            "quantize"    => TokenKind::AtQuantize,
+            "prune"       => TokenKind::AtPrune,
+            "profile"     => TokenKind::AtProfile,
+            "test"        => TokenKind::AtTest,
+            "benchmark"   => TokenKind::AtBenchmark,
+            "deprecated"  => TokenKind::AtDeprecated,
             // Plain `@` with no recognised name is the MatMul operator.
             "" => TokenKind::MatMul,
             _ => {
@@ -977,10 +1106,14 @@ impl<'src> Lexer<'src> {
             // ── Identifiers / keywords ────────────────────────────────────
             c if c.is_alphabetic() || c == '_' => self.lex_ident(c, start, line, col),
 
-            // ── Device / matmul attribute  (@gpu, @cpu, @, …) ─────────────
+            // ── Device / matmul attribute  (@gpu, @cpu, @@, @, …) ────────
             '@' => {
+                // `@@` = Kronecker product
+                if self.peek() == Some('@') {
+                    self.advance();
+                    tok!(TokenKind::KronProd, "@@")
                 // If followed immediately by an alpha we have an attribute.
-                if matches!(self.peek(), Some(c) if c.is_alphabetic()) {
+                } else if matches!(self.peek(), Some(c) if c.is_alphabetic()) {
                     self.lex_at_attribute(start, line, col)?
                 } else if self.eat('=') {
                     tok!(TokenKind::MatMulEq, "@=")
@@ -1041,7 +1174,9 @@ impl<'src> Lexer<'src> {
 
             // ── Slash / comment (already consumed above) ──────────────────
             '/' => {
-                if self.eat('=') {
+                if self.eat('/') {
+                    tok!(TokenKind::FloorDiv, "//")
+                } else if self.eat('=') {
                     tok!(TokenKind::SlashEq, "/=")
                 } else {
                     tok!(TokenKind::Slash, "/")
@@ -1081,7 +1216,9 @@ impl<'src> Lexer<'src> {
 
             // ── Caret ─────────────────────────────────────────────────────
             '^' => {
-                if self.eat('=') {
+                if self.eat('*') {
+                    tok!(TokenKind::OuterProd, "^*")
+                } else if self.eat('=') {
                     tok!(TokenKind::CaretEq, "^=")
                 } else {
                     tok!(TokenKind::Caret, "^")
