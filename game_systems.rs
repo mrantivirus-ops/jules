@@ -265,6 +265,9 @@ pub struct RenderState {
     pub meshes: HashMap<u32, Mesh>,
     pub materials: HashMap<u32, Material>,
     pub next_id: u32,
+    // 8K rendering support
+    pub width: u32,
+    pub height: u32,
 }
 
 impl RenderState {
@@ -354,7 +357,10 @@ pub fn create_cube_mesh(size: f32) -> Mesh {
 }
 
 pub fn create_sphere_mesh(radius: f32, segments: u32) -> Mesh {
+    // Clamp segments to prevent unbounded memory allocation (max 65K vertices ≈ 256 segments)
+    let segments = segments.min(256);
     let mut vertices = Vec::new();
+    let mut normals = Vec::new();
     let mut indices = Vec::new();
 
     let rings = segments;
@@ -375,6 +381,14 @@ pub fn create_sphere_mesh(radius: f32, segments: u32) -> Mesh {
             let z = radius * sin_lat * sin_lon;
 
             vertices.push([x, y, z]);
+
+            // Normal for sphere is simply the normalized position (points outward)
+            let normal = [
+                (sin_lat * cos_lon),
+                (cos_lat),
+                (sin_lat * sin_lon),
+            ];
+            normals.push(normal);
         }
     }
 
@@ -395,7 +409,7 @@ pub fn create_sphere_mesh(radius: f32, segments: u32) -> Mesh {
 
     Mesh {
         vertices,
-        normals: vec![[0.0, 1.0, 0.0]; vertices.len()],
+        normals,
         indices,
     }
 }

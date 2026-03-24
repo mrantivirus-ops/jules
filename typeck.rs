@@ -2079,6 +2079,13 @@ impl TypeCk {
     // =========================================================================
 
     fn check_agent(&mut self, a: &AgentDecl) {
+        // ─── NEW: Validate @AI decorator if present ───────────────────────────
+        if let Some(ai_attr) = a.attrs.iter().find(|attr| {
+            matches!(attr, crate::ast::Attribute::Named { name, .. } if name == "ai")
+        }) {
+            self.validate_ai_decorator(a, ai_attr);
+        }
+
         // If learning is reinforcement/imitation, there should be a policy model.
         if let Some(ls) = &a.learning {
             match &ls.kind {
@@ -2152,6 +2159,132 @@ impl TypeCk {
                 "agent `{}` declares no behaviours", a.name
             ));
         }
+    }
+
+    // ─── @AI Decorator Validation ──────────────────────────────────────────────
+    fn validate_ai_decorator(&mut self, a: &AgentDecl, attr: &crate::ast::Attribute) {
+        if let crate::ast::Attribute::Named { args, .. } = attr {
+            // Extract architecture string from first argument
+            if let Some(crate::ast::Expr::StrLit { value, span }) = args.first() {
+                // Validate architecture string format
+                if let Err(e) = self.validate_architecture_string(value) {
+                    self.diag.error(*span, format!("@AI: {}", e));
+                    return;
+                }
+
+                // Parse layers from architecture (without full parsing yet, just validate format)
+                if let Ok(layers) = self.extract_layers_from_arch(value) {
+                    // Calculate total perception size
+                    let total_perception_size: u64 = a.perceptions.iter()
+                        .map(|p| {
+                            match &p.range {
+                                Some(r) => *r as u64,
+                                None => 1,
+                            }
+                        })
+                        .sum();
+
+                    // Check if input layer matches perception size
+                    if let Some(input_size) = layers.first() {
+                        if *input_size != total_perception_size {
+                            self.diag.error(*span, format!(
+                                "@AI input layer size {} doesn't match total perception size {}. \
+                                 Perceptions: {}",
+                                *input_size,
+                                total_perception_size,
+                                a.perceptions.iter()
+                                    .map(|p| format!("{} ({})", p.name, p.range.unwrap_or(1.0)))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                        }
+                    }
+                } else {
+                    self.diag.error(*span, "@AI architecture string format is invalid".into());
+                }
+            } else {
+                self.diag.error(a.span, "@AI decorator requires a string literal argument (e.g., @AI(\"256->512->10\"))".into());
+            }
+        }
+    }
+
+    /// Validate that an architecture string has valid format
+    fn validate_architecture_string(&self, s: &str) -> Result<(), String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("empty architecture specification".into());
+        }
+
+        // Check for type prefix
+        let (arch_type, rest) = if let Some(colon_pos) = s.find(':') {
+            let (prefix, tail) = s.split_at(colon_pos);
+            (prefix.to_lowercase(), &tail[1..])  // Skip the ':'
+        } else {
+            ("mlp".into(), s)
+        };
+
+        // Validate architecture type
+        match arch_type.as_str() {
+            "mlp" | "lstm" | "cnn" | "dueling" | "transformer" => {},
+            _ => return Err(format!("unknown architecture type `{}`. Supported: mlp, lstm, cnn, dueling, transformer", arch_type)),
+        }
+
+        // Basic format validation: should have numbers and operators
+        if rest.is_empty() {
+            return Err(format!("architecture `{}:` is incomplete", arch_type));
+        }
+
+        // For MLP/LSTM: should have -> separators
+        if matches!(arch_type.as_str(), "mlp" | "lstm") && !rest.contains("->") {
+            return Err(format!("`{}` architecture must have layers separated by `->` (e.g., `{}:256->512->10`)", arch_type, arch_type));
+        }
+
+        Ok(())
+    }
+
+    /// Extract layer dimensions from architecture string (MLP format for now)
+    fn extract_layers_from_arch(&self, s: &str) -> Result<Vec<u64>, String> {
+        let s = s.trim();
+
+        // Remove type prefix if present
+        let layers_str = if let Some(colon_pos) = s.find(':') {
+            &s[colon_pos + 1..]
+        } else {
+            s
+        };
+
+        let mut layers = Vec::new();
+        let mut current_num = String::new();
+
+        for c in layers_str.chars() {
+            if c.is_ascii_digit() {
+                current_num.push(c);
+            } else {
+                if !current_num.is_empty() {
+                    if let Ok(n) = current_num.parse::<u64>() {
+                        layers.push(n);
+                    }
+                    current_num.clear();
+                }
+                // Also stop at '[' for activation notation like "256[relu]"
+                if c == '[' {
+                    break;
+                }
+            }
+        }
+
+        // Don't forget the last number
+        if !current_num.is_empty() {
+            if let Ok(n) = current_num.parse::<u64>() {
+                layers.push(n);
+            }
+        }
+
+        if layers.is_empty() {
+            return Err("no layer sizes found in architecture".into());
+        }
+
+        Ok(layers)
     }
 }
 

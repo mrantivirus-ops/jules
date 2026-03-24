@@ -349,6 +349,10 @@ pub enum Expr {
     HadamardDiv { span: Span, lhs: Box<Expr>, rhs: Box<Expr> },
     /// `A ++ B` — tensor concatenation along axis 0
     TensorConcat { span: Span, lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `kron(A, B)` — Kronecker product
+    KronProd { span: Span, lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `outer(A, B)` — outer product
+    OuterProd { span: Span, lhs: Box<Expr>, rhs: Box<Expr> },
     /// `grad A` — gradient-tracked expression
     Grad { span: Span, inner: Box<Expr> },
     /// `A ** 2` — scalar/element-wise power
@@ -418,6 +422,8 @@ impl Expr {
             Expr::HadamardMul{span, .. } => *span,
             Expr::HadamardDiv{span, .. } => *span,
             Expr::TensorConcat{span,..}  => *span,
+            Expr::KronProd  { span, .. } => *span,
+            Expr::OuterProd { span, .. } => *span,
             Expr::Grad      { span, .. } => *span,
             Expr::Pow       { span, .. } => *span,
             Expr::Range     { span, .. } => *span,
@@ -456,7 +462,7 @@ impl Expr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOpKind {
     // Arithmetic
-    Add, Sub, Mul, Div, Rem,
+    Add, Sub, Mul, Div, Rem, FloorDiv,
     // Comparison
     Eq, Ne, Lt, Le, Gt, Ge,
     // Logical
@@ -1005,6 +1011,112 @@ pub struct UsePath {
 }
 
 // =============================================================================
+// SHADER DECLARATIONS
+// =============================================================================
+
+/// Shader binding kind (uniform, buffer, sampler, texture).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShaderBindingKind {
+    Uniform,
+    Buffer,
+    Storage,
+    Sampler,
+    Texture,
+}
+
+/// A single shader binding (uniform, buffer, sampler, or texture).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShaderBinding {
+    pub span:     Span,
+    pub kind:     ShaderBindingKind,
+    pub name:     String,
+    pub ty:       Type,
+    pub binding_idx: Option<u64>,
+}
+
+/// `shader Name { vertex { … } fragment { … } compute { … } }`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShaderDecl {
+    pub span:     Span,
+    pub attrs:    Vec<Attribute>,
+    pub name:     String,
+    pub bindings: Vec<ShaderBinding>,
+    pub vertex:   Option<Box<Block>>,
+    pub fragment: Option<Box<Block>>,
+    pub compute:  Option<Box<Block>>,
+}
+
+// =============================================================================
+// SCENE DECLARATIONS
+// =============================================================================
+
+/// An instance of a prefab in a scene.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneInstance {
+    pub span:      Span,
+    pub prefab:    String,
+    pub overrides: Vec<(String, Expr)>,
+}
+
+/// `scene Name { PrefabName { field: val }, … }`
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneDecl {
+    pub span:      Span,
+    pub attrs:     Vec<Attribute>,
+    pub name:      String,
+    pub instances: Vec<SceneInstance>,
+}
+
+// =============================================================================
+// PREFAB DECLARATIONS
+// =============================================================================
+
+/// A component within a prefab.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefabComponent {
+    pub span:   Span,
+    pub name:   String,
+    pub fields: Vec<(String, Expr)>,
+}
+
+/// `prefab Name { component ComponentType { field: val }, … }`
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefabDecl {
+    pub span:       Span,
+    pub attrs:      Vec<Attribute>,
+    pub name:       String,
+    pub components: Vec<PrefabComponent>,
+}
+
+// =============================================================================
+// PHYSICS CONFIGURATION
+// =============================================================================
+
+/// `physics { gravity: expr, iterations: u64, substeps: u64, … }`
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicsConfigDecl {
+    pub span:               Span,
+    pub attrs:              Vec<Attribute>,
+    pub gravity:            Option<Expr>,
+    pub iterations:         Option<u64>,
+    pub substeps:           Option<u64>,
+    pub collision_layers:   Vec<String>,
+}
+
+// =============================================================================
+// LOSS FUNCTION DECLARATIONS
+// =============================================================================
+
+/// `loss LossName { fn forward(pred, target) -> f32 { … } }`
+#[derive(Debug, Clone, PartialEq)]
+pub struct LossDecl {
+    pub span:    Span,
+    pub attrs:   Vec<Attribute>,
+    pub name:    String,
+    pub methods: Vec<FnDecl>,
+}
+
+// =============================================================================
 // TOP-LEVEL ITEM
 // =============================================================================
 
@@ -1026,6 +1138,16 @@ pub enum Item {
     Model(ModelDecl),
     /// `train Warden in HollowFacility: …`
     Train(TrainDecl),
+    /// `shader Name { … }` — shader definition
+    Shader(ShaderDecl),
+    /// `scene Name { … }` — scene/level definition
+    Scene(SceneDecl),
+    /// `prefab Name { … }` — prefab template
+    Prefab(PrefabDecl),
+    /// `physics { … }` — physics configuration
+    PhysicsConfig(PhysicsConfigDecl),
+    /// `loss Name { … }` — custom loss function
+    Loss(LossDecl),
     /// Module declaration: `mod physics;` or `mod physics { … }`
     Mod {
         span:   Span,
@@ -1048,6 +1170,11 @@ impl Item {
             Item::Agent(a)     => a.span,
             Item::Model(m)     => m.span,
             Item::Train(t)     => t.span,
+            Item::Shader(s)    => s.span,
+            Item::Scene(s)     => s.span,
+            Item::Prefab(p)    => p.span,
+            Item::PhysicsConfig(p) => p.span,
+            Item::Loss(l)      => l.span,
             Item::Mod { span, .. } => *span,
         }
     }
@@ -1064,6 +1191,11 @@ impl Item {
             Item::Agent(a)     => &a.name,
             Item::Model(m)     => &m.name,
             Item::Train(t)     => &t.agent,
+            Item::Shader(s)    => &s.name,
+            Item::Scene(s)     => &s.name,
+            Item::Prefab(p)    => &p.name,
+            Item::PhysicsConfig(_) => "<physics>",
+            Item::Loss(l)      => &l.name,
             Item::Mod { name, .. } => name,
         }
     }
@@ -1381,6 +1513,9 @@ impl AgentDecl {
 pub enum Activation {
     Relu,
     LeakyRelu,
+    Elu,
+    Swish,
+    Mish,
     Sigmoid,
     Tanh,
     Gelu,
@@ -1477,6 +1612,17 @@ pub enum ModelLayer {
         activation: Activation,
     },
 
+    /// `residual { dense 128, dense 128 }` — residual/skip connection
+    Residual {
+        span:   Span,
+        layers: Vec<ModelLayer>,
+    },
+
+    /// `flatten` — reshape tensor to 1D
+    Flatten {
+        span: Span,
+    },
+
     /// A named sub-model used as a layer: `residual_block`
     SubModel {
         span: Span,
@@ -1497,6 +1643,8 @@ impl ModelLayer {
             ModelLayer::Dropout   { span, .. } => *span,
             ModelLayer::Norm      { span, .. } => *span,
             ModelLayer::Output    { span, .. } => *span,
+            ModelLayer::Residual  { span, .. } => *span,
+            ModelLayer::Flatten   { span, .. } => *span,
             ModelLayer::SubModel  { span, .. } => *span,
         }
     }
@@ -1561,7 +1709,7 @@ pub struct OptimizerSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OptimizerKind { Adam, Sgd, Rmsprop, Adagrad, AdamW }
+pub enum OptimizerKind { Adam, Sgd, Rmsprop, Adagrad, AdamW, Lion, Sophia, Prodigy }
 
 impl ModelDecl {
     /// Count layers (excluding Input/Output markers).
@@ -1647,6 +1795,10 @@ pub struct TrainDecl {
     pub optimizer: Option<OptimizerSpec>,
     /// Extra hyperparameters as key/value expressions.
     pub hyper:   Vec<(String, Expr)>,
+    /// RL algorithm: "ppo", "dqn", "sac", "reinforce", etc.
+    pub algorithm: Option<String>,
+    /// Value model for dueling/two-headed architectures.
+    pub value_model: Option<String>,
 }
 
 impl TrainDecl {
@@ -1889,6 +2041,8 @@ pub fn walk_expr<V: Visitor>(v: &mut V, e: &Expr) {
         Expr::HadamardMul{ lhs, rhs, .. }      => { v.visit_expr(lhs); v.visit_expr(rhs); }
         Expr::HadamardDiv{ lhs, rhs, .. }      => { v.visit_expr(lhs); v.visit_expr(rhs); }
         Expr::TensorConcat{lhs, rhs, .. }      => { v.visit_expr(lhs); v.visit_expr(rhs); }
+        Expr::KronProd   { lhs, rhs, .. }      => { v.visit_expr(lhs); v.visit_expr(rhs); }
+        Expr::OuterProd  { lhs, rhs, .. }      => { v.visit_expr(lhs); v.visit_expr(rhs); }
         Expr::Grad       { inner, .. }         => v.visit_expr(inner),
         Expr::Pow        { base, exp, .. }     => { v.visit_expr(base); v.visit_expr(exp); }
         Expr::VecCtor    { elems, .. }         => { for e in elems { v.visit_expr(e); } }

@@ -274,7 +274,7 @@ impl Parser {
                 | TokenKind::AtUnroll   | TokenKind::AtJit    | TokenKind::AtVmap
                 | TokenKind::AtCheckpoint | TokenKind::AtQuantize | TokenKind::AtPrune
                 | TokenKind::AtProfile  | TokenKind::AtTest   | TokenKind::AtBenchmark
-                | TokenKind::AtDeprecated => {
+                | TokenKind::AtDeprecated | TokenKind::AtAi => {
                     let raw = format!("{:?}", self.peek().kind);
                     let name = raw.trim_start_matches("At").to_lowercase();
                     self.advance();
@@ -1884,7 +1884,7 @@ impl Parser {
                         self.eat(&TokenKind::Comma);
                     }
                     self.expect(&TokenKind::RBrace)?;
-                    return Ok(ModelLayer::Residual { span: nspan, inner });
+                    return Ok(ModelLayer::Residual { span: nspan, layers: inner });
                 }
                 // `flatten` — collapse spatial dims
                 if name == "flatten" {
@@ -2145,7 +2145,7 @@ impl Parser {
                         TokenKind::KwTexture => ShaderBindingKind::Texture,
                         _ => ShaderBindingKind::Uniform,
                     };
-                    bindings.push(ShaderBinding { span: bspan, name: bname, ty: bty, kind: bkind, index: binding_idx });
+                    bindings.push(ShaderBinding { span: bspan, name: bname, ty: bty, kind: bkind, binding_idx });
                     self.eat(&TokenKind::Semicolon);
                     self.eat(&TokenKind::Comma);
                 }
@@ -2169,7 +2169,9 @@ impl Parser {
         Ok(ShaderDecl {
             span: start.merge(end),
             attrs, name, bindings,
-            vertex_body, fragment_body, compute_body,
+            vertex: vertex_body.map(Box::new),
+            fragment: fragment_body.map(Box::new),
+            compute: compute_body.map(Box::new),
         })
     }
 
@@ -2219,7 +2221,7 @@ impl Parser {
     }
 
     // ── physics { gravity: vec3(0,-9.8,0), iterations: 10, … } ──────────────
-    fn parse_physics_config(&mut self, attrs: Vec<Attribute>) -> ParseResult<PhysicsConfig> {
+    fn parse_physics_config(&mut self, attrs: Vec<Attribute>) -> ParseResult<PhysicsConfigDecl> {
         let start = self.expect(&TokenKind::KwPhysics)?;
         self.expect(&TokenKind::LBrace)?;
         let mut gravity = None;
@@ -2245,7 +2247,7 @@ impl Parser {
         }
 
         let end = self.expect(&TokenKind::RBrace)?;
-        Ok(PhysicsConfig { span: start.merge(end), attrs, gravity, iterations, substeps, collision_layers })
+        Ok(PhysicsConfigDecl { span: start.merge(end), attrs, gravity, iterations, substeps, collision_layers })
     }
 
     // ── loss LossName { fn forward(pred, target) -> f32 { … } } ─────────────

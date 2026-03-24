@@ -338,6 +338,7 @@ pub enum TokenKind {
     AtTest,        // @test        — mark function as a unit test
     AtBenchmark,   // @benchmark   — mark function as a microbenchmark
     AtDeprecated,  // @deprecated  — emit deprecation warning at call sites
+    AtAi,          // @ai          — neural network injection into agent
 
     // ── Operators ─────────────────────────────────────────────────────────
 
@@ -1058,6 +1059,7 @@ impl<'src> Lexer<'src> {
             "test"        => TokenKind::AtTest,
             "benchmark"   => TokenKind::AtBenchmark,
             "deprecated"  => TokenKind::AtDeprecated,
+            "ai"          => TokenKind::AtAi,
             // Plain `@` with no recognised name is the MatMul operator.
             "" => TokenKind::MatMul,
             _ => {

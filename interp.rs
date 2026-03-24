@@ -1232,661 +1232,531 @@ impl Interpreter {
         let mut result = Value::Unit;
         for stmt in &block.stmts {
             result = self.eval_stmt(stmt, env)?;
-            if result.is_signal() { break; }
+impl AiArchitectureSpec {
+    /// Parse @AI("256->512->10-opt-adam-lr-0.001-explore-epsilon-gamma-0.99")
+    fn parse_from_string(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("empty architecture specification".into());
         }
-        if !result.is_signal() {
-            if let Some(tail) = &block.tail {
-                result = self.eval_expr(tail, env)?;
+
+        // Find learning config start
+        let config_start = s.char_indices()
+            .find(|(i, _)| {
+                s[*i..].starts_with("-opt-") ||
+                s[*i..].starts_with("-lr-") ||
+                s[*i..].starts_with("-explore-") ||
+                s[*i..].starts_with("-gamma-") ||
+                s[*i..].starts_with("-epsilon-") ||
+                s[*i..].starts_with("-temp-")
+            })
+            .map(|(i, _)| i);
+
+        let (arch_str, config_str) = match config_start {
+            Some(pos) => {
+                let (arch, cfg) = s.split_at(pos);
+                (arch.trim(), Some(cfg[1..].trim()))
             }
-        }
-        env.pop();
-        Ok(result)
-    }
-
-    // =========================================================================
-    // §11  STATEMENT EVALUATION
-    // =========================================================================
-
-    pub fn eval_stmt(&mut self, stmt: &Stmt, env: &mut Env) -> Result<Value, RuntimeError> {
-        match stmt {
-            Stmt::Let { pattern, init, .. } => {
-                let val = if let Some(e) = init {
-                    self.eval_expr(e, env)?
-                } else {
-                    Value::Unit
-                };
-                self.bind_pattern(pattern, val, env);
-                Ok(Value::Unit)
-            }
-
-            Stmt::Expr { expr, .. } => self.eval_expr(expr, env),
-
-            Stmt::Return { value, .. } => {
-                let v = if let Some(e) = value { self.eval_expr(e, env)? }
-                        else { Value::Unit };
-                Ok(Value::Return(Box::new(v)))
-            }
-
-            Stmt::Break { value, .. } => {
-                let v = if let Some(e) = value {
-                    Some(Box::new(self.eval_expr(e, env)?))
-                } else { None };
-                Ok(Value::Break(v))
-            }
-
-            Stmt::Continue { .. } => Ok(Value::Continue),
-
-            Stmt::ForIn { pattern, iter, body, .. } => {
-                let iter_val = self.eval_expr(iter, env)?;
-                let items = self.value_to_iter(iter_val)?;
-                for item in items {
-                    env.push();
-                    self.bind_pattern(pattern, item, env);
-                    let r = self.eval_block(body, env)?;
-                    env.pop();
-                    match r {
-                        Value::Break(_) => break,
-                        Value::Continue => continue,
-                        v if v.is_signal() => return Ok(v),
-                        _ => {}
-                    }
-                }
-                Ok(Value::Unit)
-            }
-
-            Stmt::EntityFor { var, query, body, parallelism, .. } => {
-                self.eval_entity_for(var, query, body, *parallelism, env)
-            }
-
-            Stmt::While { cond, body, .. } => {
-                loop {
-                    let c = self.eval_expr(cond, env)?;
-                    if !c.is_truthy() { break; }
-                    let r = self.eval_block(body, env)?;
-                    match r {
-                        Value::Break(_) => break,
-                        Value::Continue => continue,
-                        v if v.is_signal() => return Ok(v),
-                        _ => {}
-                    }
-                }
-                Ok(Value::Unit)
-            }
-
-            Stmt::Loop { body, .. } => {
-                loop {
-                    let r = self.eval_block(body, env)?;
-                    match r {
-                        Value::Break(v) => return Ok(v.map(|b| *b).unwrap_or(Value::Unit)),
-                        Value::Continue => continue,
-                        v if v.is_signal() => return Ok(v),
-                        _ => {}
-                    }
-                }
-            }
-
-            Stmt::If { cond, then, else_, .. } => {
-                let c = self.eval_expr(cond, env)?;
-                if c.is_truthy() {
-                    self.eval_block(then, env)
-                } else if let Some(e) = else_ {
-                    match e.as_ref() {
-                        crate::ast::IfOrBlock::If(s)    => self.eval_stmt(s, env),
-                        crate::ast::IfOrBlock::Block(b) => self.eval_block(b, env),
-                    }
-                } else {
-                    Ok(Value::Unit)
-                }
-            }
-
-            Stmt::Match { expr, arms, .. } => {
-                let scrutinee = self.eval_expr(expr, env)?;
-                for arm in arms {
-                    if self.pattern_matches(&arm.pat, &scrutinee) {
-                        env.push();
-                        self.bind_pattern(&arm.pat, scrutinee.clone(), env);
-                        let guard_ok = if let Some(g) = &arm.guard {
-                            self.eval_expr(g, env)?.is_truthy()
-                        } else { true };
-                        let result = if guard_ok {
-                            self.eval_expr(&arm.body, env)?
-                        } else {
-                            env.pop();
-                            continue;
-                        };
-                        env.pop();
-                        return Ok(result);
-                    }
-                }
-                Ok(Value::Unit)
-            }
-
-            Stmt::Item(i) => { self.load_item(i); Ok(Value::Unit) }
-
-            Stmt::ParallelFor(pf) => {
-                let iter_val = self.eval_expr(&pf.iter, env)?;
-                let items = self.value_to_iter(iter_val)?;
-                // In the interpreter we execute sequentially;
-                // a rayon par_iter() call replaces this in the compiled backend.
-                for item in items {
-                    env.push();
-                    self.bind_pattern(&pf.var, item, env);
-                    let r = self.eval_block(&pf.body, env)?;
-                    env.pop();
-                    match r {
-                        Value::Break(_) => break,
-                        Value::Continue => continue,
-                        v if v.is_signal() => return Ok(v),
-                        _ => {}
-                    }
-                }
-                Ok(Value::Unit)
-            }
-
-            Stmt::Spawn(sb) => {
-                // In the interpreter we run the body inline (no true async).
-                self.eval_block(&sb.body, env)
-            }
-
-            Stmt::Sync(sb)   => self.eval_block(&sb.body, env),
-            Stmt::Atomic(ab) => self.eval_block(&ab.body, env),
-        }
-    }
-
-    // ── Entity-for evaluation ──────────────────────────────────────────────
-
-    fn eval_entity_for(
-        &mut self,
-        var:         &str,
-        query:       &EntityQuery,
-        body:        &Block,
-        parallelism: ParallelismHint,
-        env:         &mut Env,
-    ) -> Result<Value, RuntimeError> {
-        // Snapshot the matching entity list (safe: world locked briefly).
-        let entity_ids = {
-            let w = self.world.lock().unwrap();
-            w.query(&query.with, &query.without)
+            None => (s, None),
         };
 
-        // Apply optional filter expression.
-        let mut ids_to_run = Vec::new();
-        for id in entity_ids {
-            if let Some(filter_expr) = &query.filter {
-                env.push();
-                env.set_local(var, Value::Entity(id));
-                let ok = self.eval_expr(filter_expr, env)?.is_truthy();
-                env.pop();
-                if ok { ids_to_run.push(id); }
-            } else {
-                ids_to_run.push(id);
-            }
+        // Parse architecture
+        let mut spec = Self::parse_architecture(arch_str)?;
+
+        // Apply learning config if present
+        if let Some(cfg) = config_str {
+            Self::apply_learning_config_to_spec(&mut spec, cfg)?;
         }
 
-        match parallelism {
-            ParallelismHint::Sequential | ParallelismHint::Auto => {
-                // Sequential: deterministic order guaranteed.
-                for id in &ids_to_run {
-                    env.push();
-                    env.set_local(var, Value::Entity(*id));
-                    let r = self.eval_block(body, env)?;
-                    env.pop();
-                    match r {
-                        Value::Break(_) => break,
-                        Value::Continue => continue,
-                        v if v.is_signal() => return Ok(v),
-                        _ => {}
-                    }
-                }
-            }
-            ParallelismHint::Parallel | ParallelismHint::Simd
-            | ParallelismHint::Gpu   | ParallelismHint::SimdOrGpu { .. } => {
-                // Parallel: interpreter falls back to sequential with a note.
-                // A real backend uses rayon::par_iter() or GPU dispatch here.
-                for id in &ids_to_run {
-                    env.push();
-                    env.set_local(var, Value::Entity(*id));
-                    let r = self.eval_block(body, env)?;
-                    env.pop();
-                    if r.is_signal() { return Ok(r); }
-                }
-            }
-        }
-        Ok(Value::Unit)
+        Ok(spec)
     }
 
-    // =========================================================================
-    // §12  EXPRESSION EVALUATION
-    // =========================================================================
-
-    pub fn eval_expr(&mut self, expr: &Expr, env: &mut Env) -> Result<Value, RuntimeError> {
-        match expr {
-            Expr::IntLit   { value, .. } => Ok(Value::I32(*value as i32)),
-            Expr::FloatLit { value, .. } => Ok(Value::F32(*value as f32)),
-            Expr::BoolLit  { value, .. } => Ok(Value::Bool(*value)),
-            Expr::StrLit   { value, .. } => Ok(Value::Str(value.clone())),
-
-            Expr::Ident { name, span } => {
-                // Check local env first, then built-ins.
-                if let Some(v) = env.get(name) { return Ok(v.clone()); }
-                if name == "world" {
-                    return Ok(Value::World(self.world.clone()));
-                }
-                if let Some(f) = self.fns.get(name.as_str()).cloned() {
-                    return Ok(Value::Fn(f));
-                }
-                if let Some(m) = self.models.get(name.as_str()).cloned() {
-                    return Ok(Value::Model(m));
-                }
-                rt_err!("undefined variable `{name}`")
-            }
-
-            Expr::Path { segments, .. } => {
-                let name = segments.join("::");
-                if let Some(v) = env.get(&name) { return Ok(v.clone()); }
-                if let Some(f) = self.fns.get(name.as_str()).cloned() {
-                    return Ok(Value::Fn(f));
-                }
-                rt_err!("undefined path `{name}`")
-            }
-
-            // ── Vector constructors ────────────────────────────────────────────
-            Expr::VecCtor { size, elems, span } => {
-                let vals: Vec<f32> = elems.iter()
-                    .map(|e| self.eval_expr(e, env).and_then(|v| {
-                        v.as_f64().map(|f| f as f32)
-                            .ok_or_else(|| RuntimeError::new("vec element must be numeric"))
-                    }))
-                    .collect::<Result<_, _>>()?;
-                match size {
-                    VecSize::N2 => Ok(Value::Vec2([vals[0], vals[1]])),
-                    VecSize::N3 => Ok(Value::Vec3([vals[0], vals[1], vals[2]])),
-                    VecSize::N4 => Ok(Value::Vec4([vals[0], vals[1], vals[2], vals[3]])),
-                }
-            }
-
-            Expr::ArrayLit { elems, .. } => {
-                let vals: Vec<Value> = elems.iter()
-                    .map(|e| self.eval_expr(e, env))
-                    .collect::<Result<_, _>>()?;
-                Ok(Value::Array(Arc::new(Mutex::new(vals))))
-            }
-
-            Expr::Tuple { elems, .. } => {
-                let vals: Vec<Value> = elems.iter()
-                    .map(|e| self.eval_expr(e, env))
-                    .collect::<Result<_, _>>()?;
-                Ok(Value::Tuple(vals))
-            }
-
-            // ── Arithmetic ────────────────────────────────────────────────────
-            Expr::BinOp { op, lhs, rhs, span } => {
-                self.eval_binop(*op, lhs, rhs, env).map_err(|e| e.at(*span))
-            }
-
-            Expr::UnOp { op, expr, span } => {
-                let v = self.eval_expr(expr, env)?;
-                self.eval_unop(*op, v).map_err(|e| e.at(*span))
-            }
-
-            // ── Assignment ────────────────────────────────────────────────────
-            Expr::Assign { op, target, value, .. } => {
-                let rhs = self.eval_expr(value, env)?;
-                self.eval_assign(*op, target, rhs, env)
-            }
-
-            // ── Field access ──────────────────────────────────────────────────
-            Expr::Field { object, field, span } => {
-                let obj = self.eval_expr(object, env)?;
-                self.eval_field(obj, field).map_err(|e| e.at(*span))
-            }
-
-            // ── Index ─────────────────────────────────────────────────────────
-            Expr::Index { object, indices, span } => {
-                let obj = self.eval_expr(object, env)?;
-                let idxs: Vec<Value> = indices.iter()
-                    .map(|i| self.eval_expr(i, env))
-                    .collect::<Result<_, _>>()?;
-                self.eval_index(obj, idxs).map_err(|e| e.at(*span))
-            }
-
-            // ── Calls ─────────────────────────────────────────────────────────
-            Expr::Call { func, args, named, span } => {
-                // Check for built-in functions by name first
-                if let Expr::Ident { name, .. } = func.as_ref() {
-                    let args_v: Vec<Value> = args.iter()
-                        .map(|a| self.eval_expr(a, env))
-                        .collect::<Result<_, _>>()?;
-                    if let Ok(result) = self.eval_builtin(name, args_v) {
-                        return Ok(result);
-                    }
-                }
-                // Otherwise, try normal function evaluation
-                let args_v: Vec<Value> = args.iter()
-                    .map(|a| self.eval_expr(a, env))
-                    .collect::<Result<_, _>>()?;
-                let func_v = self.eval_expr(func, env)?;
-                self.eval_call(func_v, args_v, env).map_err(|e| e.at(*span))
-            }
-
-            Expr::MethodCall { receiver, method, args, span } => {
-                let recv = self.eval_expr(receiver, env)?;
-                let args_v: Vec<Value> = args.iter()
-                    .map(|a| self.eval_expr(a, env))
-                    .collect::<Result<_, _>>()?;
-                self.eval_method(recv, method, args_v).map_err(|e| e.at(*span))
-            }
-
-            // ── Tensor-specific (Feature 1) ───────────────────────────────────
-            Expr::MatMul { lhs, rhs, span } => {
-                let l = self.eval_expr(lhs, env)?;
-                let r = self.eval_expr(rhs, env)?;
-                self.eval_matmul(l, r).map_err(|e| e.at(*span))
-            }
-
-            Expr::HadamardMul { lhs, rhs, span } => {
-                let l = self.eval_tensor(lhs, env)?;
-                let r = self.eval_tensor(rhs, env)?;
-                let out = l.read().unwrap().hadamard_mul(&r.read().unwrap())?;
-                Ok(Value::Tensor(Arc::new(RwLock::new(out))))
-            }
-
-            Expr::HadamardDiv { lhs, rhs, span } => {
-                let l = self.eval_tensor(lhs, env)?;
-                let r = self.eval_tensor(rhs, env)?;
-                let out = l.read().unwrap().hadamard_div(&r.read().unwrap())?;
-                Ok(Value::Tensor(Arc::new(RwLock::new(out))))
-            }
-
-            Expr::TensorConcat { lhs, rhs, span } => {
-                let l = self.eval_tensor(lhs, env)?;
-                let r = self.eval_tensor(rhs, env)?;
-                let out = l.read().unwrap().concat(&r.read().unwrap())?;
-                Ok(Value::Tensor(Arc::new(RwLock::new(out))))
-            }
-
-            Expr::Grad { inner, .. } => {
-                let v = self.eval_expr(inner, env)?;
-                if let Value::Tensor(t) = &v {
-                    t.write().unwrap().enable_grad();
-                }
-                Ok(v)
-            }
-
-            Expr::Pow { base, exp, .. } => {
-                let b = self.eval_expr(base, env)?;
-                let e = self.eval_expr(exp, env)?;
-                match (&b, &e) {
-                    (Value::F32(x), Value::F32(y))   => Ok(Value::F32(x.powf(*y))),
-                    (Value::F64(x), Value::F64(y))   => Ok(Value::F64(x.powf(*y))),
-                    (Value::I32(x), Value::I32(y))   => Ok(Value::I32(x.pow(*y as u32))),
-                    _ => {
-                        if let (Some(x), Some(y)) = (b.as_f64(), e.as_f64()) {
-                            Ok(Value::F64(x.powf(y)))
-                        } else {
-                            rt_err!("** requires numeric operands")
-                        }
-                    }
-                }
-            }
-
-            Expr::Range { lo, hi, inclusive, .. } => {
-                let lo_v = lo.as_ref().map(|e| self.eval_expr(e, env)).transpose()?;
-                let hi_v = hi.as_ref().map(|e| self.eval_expr(e, env)).transpose()?;
-                let start = lo_v.and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let end   = hi_v.and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let range: Vec<Value> = if *inclusive {
-                    (start..=end).map(Value::I32).collect()
-                } else {
-                    (start..end).map(Value::I32).collect()
-                };
-                Ok(Value::Array(Arc::new(Mutex::new(range))))
-            }
-
-            Expr::Cast { expr, ty, .. } => {
-                let v = self.eval_expr(expr, env)?;
-                self.eval_cast(v, ty)
-            }
-
-            Expr::IfExpr { cond, then, else_, .. } => {
-                let c = self.eval_expr(cond, env)?;
-                if c.is_truthy() {
-                    self.eval_block(then, env)
-                } else if let Some(b) = else_ {
-                    self.eval_block(b, env)
-                } else {
-                    Ok(Value::Unit)
-                }
-            }
-
-            Expr::Closure { params, body, .. } => {
-                // Capture current environment.
-                let mut capture = Frame::new();
-                for frame in &env.frames {
-                    for (k, v) in frame { capture.insert(k.clone(), v.clone()); }
-                }
-                let decl = FnDecl {
-                    span:     crate::lexer::Span::dummy(),
-                    attrs:    vec![],
-                    name:     "<closure>".into(),
-                    generics: vec![],
-                    params:   params.clone(),
-                    ret_ty:   None,
-                    body:     Some(Block {
-                        span:  crate::lexer::Span::dummy(),
-                        stmts: vec![],
-                        tail:  Some(body.clone()),
-                    }),
-                    is_async: false,
-                };
-                Ok(Value::Fn(Arc::new(FnClosure { decl, capture })))
-            }
-
-            Expr::Block(b) => self.eval_block(b, env),
-
-            Expr::StructLit { name, fields, .. } => {
-                let mut field_vals = HashMap::new();
-                for (fname, fexpr) in fields {
-                    field_vals.insert(fname.clone(), self.eval_expr(fexpr, env)?);
-                }
-                Ok(Value::Struct { name: name.clone(), fields: field_vals })
-            }
-        }
-    }
-
-    // ── Tensor helper ──────────────────────────────────────────────────────
-
-    fn eval_tensor(&mut self, expr: &Expr, env: &mut Env) -> Result<Arc<RwLock<Tensor>>, RuntimeError> {
-        match self.eval_expr(expr, env)? {
-            Value::Tensor(t) => Ok(t),
-            other => rt_err!("expected tensor, got `{}`", other.type_name()),
-        }
-    }
-
-    // =========================================================================
-    // §13  OPERATOR EVALUATION
-    // =========================================================================
-
-    fn eval_binop(&mut self, op: BinOpKind, lhs: &Expr, rhs: &Expr, env: &mut Env)
-        -> Result<Value, RuntimeError>
-    {
-        // Short-circuit logical operators.
-        if op == BinOpKind::And {
-            let l = self.eval_expr(lhs, env)?;
-            return if !l.is_truthy() { Ok(Value::Bool(false)) }
-                   else { Ok(Value::Bool(self.eval_expr(rhs, env)?.is_truthy())) };
-        }
-        if op == BinOpKind::Or {
-            let l = self.eval_expr(lhs, env)?;
-            return if l.is_truthy() { Ok(Value::Bool(true)) }
-                   else { Ok(Value::Bool(self.eval_expr(rhs, env)?.is_truthy())) };
+    fn parse_architecture(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("empty architecture specification".into());
         }
 
-        let l = self.eval_expr(lhs, env)?;
-        let r = self.eval_expr(rhs, env)?;
-        eval_numeric_binop(op, l, r)
-    }
-
-    fn eval_unop(&self, op: UnOpKind, v: Value) -> Result<Value, RuntimeError> {
-        match op {
-            UnOpKind::Neg => match v {
-                Value::F32(x) => Ok(Value::F32(-x)),
-                Value::F64(x) => Ok(Value::F64(-x)),
-                Value::I32(x) => Ok(Value::I32(-x)),
-                Value::I64(x) => Ok(Value::I64(-x)),
-                Value::Vec3(v) => Ok(Value::Vec3([-v[0], -v[1], -v[2]])),
-                Value::Tensor(t) => {
-                    let data: Vec<f32> = t.read().unwrap().cpu_data().iter().map(|x| -x).collect();
-                    let shape = t.read().unwrap().shape.clone();
-                    Ok(Value::Tensor(Arc::new(RwLock::new(Tensor::from_data(shape, data)))))
-                }
-                _ => rt_err!("unary `-` on `{}`", v.type_name()),
-            },
-            UnOpKind::Not => match v {
-                Value::Bool(b) => Ok(Value::Bool(!b)),
-                Value::I32(x)  => Ok(Value::I32(!x)),
-                Value::I64(x)  => Ok(Value::I64(!x)),
-                _ => rt_err!("unary `!` on `{}`", v.type_name()),
-            },
-            UnOpKind::Deref | UnOpKind::Ref | UnOpKind::RefMut => Ok(v),
-        }
-    }
-
-    fn eval_matmul(&mut self, l: Value, r: Value) -> Result<Value, RuntimeError> {
-        match (l, r) {
-            (Value::Tensor(a), Value::Tensor(b)) => {
-                let out = a.read().unwrap().matmul(&b.read().unwrap())?;
-                Ok(Value::Tensor(Arc::new(RwLock::new(out))))
-            }
-            (Value::Mat3(a), Value::Mat3(b)) => {
-                Ok(Value::Mat3(mat3_mul(a, b)))
-            }
-            (Value::Mat4(a), Value::Mat4(b)) => {
-                Ok(Value::Mat4(mat4_mul(a, b)))
-            }
-            (Value::Mat3(m), Value::Vec3(v)) => {
-                Ok(Value::Vec3(mat3_vec3_mul(m, v)))
-            }
-            (Value::Mat4(m), Value::Vec4(v)) => {
-                Ok(Value::Vec4(mat4_vec4_mul(m, v)))
-            }
-            (l, r) => rt_err!("@ requires tensor/matrix operands, got `{}` @ `{}`",
-                               l.type_name(), r.type_name()),
-        }
-    }
-
-    // =========================================================================
-    // §14  ASSIGNMENT
-    // =========================================================================
-
-    fn eval_assign(&mut self, op: AssignOpKind, target: &Expr, rhs: Value, env: &mut Env)
-        -> Result<Value, RuntimeError>
-    {
-        // For compound assignments, read current value first.
-        let effective_rhs = if op == AssignOpKind::Assign {
-            rhs
+        // Check for type prefix
+        let (arch_type, rest) = if let Some(colon_pos) = s.find(':') {
+            let (prefix, tail) = s.split_at(colon_pos);
+            (prefix.trim().to_lowercase(), tail[1..].trim())
         } else {
-            let current = self.eval_expr(target, env)?;
-            let bin_op = op.to_binop()
-                .ok_or_else(|| RuntimeError::new("unknown compound assignment"))?;
-            // MatMulAssign: @=
-            if op == AssignOpKind::MatMulAssign {
-                self.eval_matmul(current, rhs)?
-            } else {
-                eval_numeric_binop(bin_op, current, rhs)?
-            }
+            ("mlp".to_string(), s)
         };
 
-        // Write back to the target.
-        match target {
-            Expr::Ident { name, .. } => {
-                env.set(name, effective_rhs);
-            }
-            Expr::Field { object, field, .. } => {
-                if let Expr::Ident { name, .. } = object.as_ref() {
-                    // For entity field access, write to the world.
-                    if let Some(Value::Entity(id)) = env.get(name).cloned() {
-                        let mut w = self.world.lock().unwrap();
-                        if let Some(comp) = w.get_component_mut(id, field) {
-                            *comp = effective_rhs;
-                        } else {
-                            w.insert_component(id, field, effective_rhs);
-                        }
-                    } else if let Some(Value::Struct { fields, .. }) = env.get(name).cloned() {
-                        let mut s = env.get(name).unwrap().clone();
-                        if let Value::Struct { ref mut fields, .. } = s {
-                            fields.insert(field.clone(), effective_rhs);
-                        }
-                        env.set(name, s);
-                    }
-                }
-            }
-            Expr::Index { object, indices, .. } => {
-                if let Expr::Ident { name, .. } = object.as_ref() {
-                    let idx = if let Some(e) = indices.first() {
-                        self.eval_expr(e, env)?.as_i64().unwrap_or(0) as usize
-                    } else { 0 };
-                    if let Some(Value::Array(arr)) = env.get(name).cloned() {
-                        arr.lock().unwrap()[idx] = effective_rhs;
-                    }
-                }
-            }
-            _ => {}
+        match arch_type.as_str() {
+            "mlp" => Self::parse_mlp(rest),
+            "lstm" => Self::parse_lstm(rest),
+            "cnn" => Self::parse_cnn(rest),
+            "dueling" => Self::parse_dueling(rest),
+            "transformer" => Self::parse_transformer(rest),
+            _ => Err(format!(
+                "unknown architecture type `{}`. Supported: mlp, lstm, cnn, dueling, transformer",
+                arch_type
+            )),
         }
-        Ok(Value::Unit)
     }
 
-    // =========================================================================
-    // §15  FIELD AND INDEX ACCESS
-    // =========================================================================
+    fn parse_u64(s: &str, context: &str) -> Result<u64, String> {
+        s.parse()
+            .map_err(|_| format!("invalid {} `{}`", context, s))
+    }
 
-    fn eval_field(&mut self, obj: Value, field: &str) -> Result<Value, RuntimeError> {
-        match obj {
-            Value::Struct { ref fields, .. } => {
-                fields.get(field).cloned()
-                    .ok_or_else(|| RuntimeError::new(format!("no field `{field}`")))
+    fn extract_bracketed_content(s: &str, context: &str) -> Result<String, String> {
+        let bracket_start = s.find('[').ok_or(format!("missing `[` in {}", context))?;
+        let bracket_end = s.find(']').ok_or(format!("unclosed `[` in {}", context))?;
+        Ok(s[bracket_start + 1..bracket_end].to_string())
+    }
+
+    fn parse_mlp(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if !s.contains("->") {
+            return Err("MLP must have layers separated by `->`".into());
+        }
+
+        let mut layers = Vec::with_capacity(8);
+        let mut activations = Vec::with_capacity(8);
+
+        for segment in s.split("->") {
+            let segment = segment.trim();
+
+            // Extract number and optional activation
+            let (num_str, act) = if let Some(bracket_pos) = segment.find('[') {
+                let num = &segment[..bracket_pos];
+                let act_start = bracket_pos + 1;
+                let act_end = segment.find(']').ok_or("unclosed `[` in activation")?;
+                let act_name = &segment[act_start..act_end].trim();
+                (num, ActivationType::from_str(act_name)?)
+            } else {
+                (segment, ActivationType::Relu)
+            };
+
+            let size = Self::parse_u64(num_str, "layer size")?;
+            if size == 0 {
+                return Err("layer size must be > 0".into());
             }
-            Value::Entity(id) => {
-                let w = self.world.lock().unwrap();
-                // Field name maps to component type by convention (lowercase → CamelCase).
-                // We try the field name directly, then a title-cased version.
-                let comp = w.get_component(id, field)
-                    .or_else(|| {
-                        let titled = title_case(field);
-                        w.get_component(id, &titled)
+
+            layers.push(size);
+            activations.push(act);
+        }
+
+        if layers.len() < 2 {
+            return Err("MLP must have at least input and output layers".into());
+        }
+
+        // Pad activations and set final layer to softmax
+        while activations.len() < layers.len() {
+            activations.push(ActivationType::Relu);
+        }
+        activations.truncate(layers.len());
+        activations[layers.len() - 1] = ActivationType::Softmax;
+
+        let output_size = *layers.last().unwrap();
+        Ok(AiArchitectureSpec::Mlp {
+            layers,
+            activations,
+            output_size,
+            learning: LearningConfig::default(),
+        })
+    }
+
+    fn parse_lstm(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if !s.contains("->") {
+            return Err("LSTM must have layers separated by `->`".into());
+        }
+
+        let mut units = Vec::with_capacity(8);
+        for segment in s.split("->") {
+            let size = Self::parse_u64(segment.trim(), "LSTM size")?;
+            if size == 0 {
+                return Err("LSTM unit size must be > 0".into());
+            }
+            units.push(size);
+        }
+
+        if units.len() < 2 {
+            return Err("LSTM must have at least input and output".into());
+        }
+
+        let output_size = *units.last().unwrap();
+        let mut activations = vec![ActivationType::Tanh; units.len()];
+        activations[units.len() - 1] = ActivationType::Softmax;
+
+        Ok(AiArchitectureSpec::Lstm {
+            units,
+            activations,
+            output_size,
+            learning: LearningConfig::default(),
+        })
+    }
+
+    fn parse_cnn(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        let parts: Vec<&str> = s.split('-').map(|p| p.trim()).collect();
+
+        if parts.len() < 4 {
+            return Err("CNN format: kernel-filter1-filter2-spatial_h-spatial_w (minimum 4 params)".into());
+        }
+
+        let kernel_size = Self::parse_u64(parts[0], "kernel size")?;
+        let spatial_h = Self::parse_u64(parts[parts.len() - 2], "spatial height")?;
+        let spatial_w = Self::parse_u64(parts[parts.len() - 1], "spatial width")?;
+
+        let mut filters = Vec::with_capacity(4);
+        for i in 1..parts.len() - 2 {
+            let filter = Self::parse_u64(parts[i], "filter count")?;
+            if filter == 0 {
+                return Err("filter count must be > 0".into());
+            }
+            filters.push(filter);
+        }
+
+        if filters.is_empty() {
+            return Err("CNN must specify at least one filter count".into());
+        }
+
+        let output_size = *filters.last().unwrap();
+        let activations = vec![ActivationType::Relu; filters.len()];
+
+        Ok(AiArchitectureSpec::Cnn {
+            filters,
+            kernel_size,
+            spatial: (spatial_h, spatial_w),
+            activations,
+            output_size,
+            learning: LearningConfig::default(),
+        })
+    }
+
+    fn parse_dueling(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        let parts: Vec<&str> = s.split("->").map(|p| p.trim()).collect();
+
+        if parts.len() != 3 {
+            return Err("Dueling format: input_size->value[units]->policy[units]".into());
+        }
+
+        let input_size = Self::parse_u64(parts[0], "input size")?;
+        let value_units = Self::parse_named_layer_value(parts[1], "value")?;
+        let policy_units = Self::parse_named_layer_value(parts[2], "policy")?;
+
+        Ok(AiArchitectureSpec::Dueling {
+            input_size,
+            value_units,
+            policy_units,
+            learning: LearningConfig::default(),
+        })
+    }
+
+    fn parse_named_layer_value(s: &str, expected_name: &str) -> Result<u64, String> {
+        let s = s.trim();
+        if !s.starts_with(expected_name) {
+            return Err(format!("expected `{}[...]`, got `{}`", expected_name, s));
+        }
+        let bracket_start = s.find('[').ok_or("missing `[` in layer spec")?;
+        let bracket_end = s.find(']').ok_or("unclosed `[` in layer spec")?;
+        let units_str = &s[bracket_start + 1..bracket_end];
+        Self::parse_u64(units_str, &format!("{} units", expected_name))
+    }
+
+    fn parse_transformer(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+
+        let bracket_start = s.find('[').ok_or("Transformer format: transformer[heads-N-dim-D-depth-L-ff-F]")?;
+        let bracket_end = s.find(']').ok_or("unclosed `[` in transformer spec")?;
+        let content = &s[bracket_start + 1..bracket_end];
+
+        let mut heads = None;
+        let mut dim = None;
+        let mut depth = None;
+        let mut ff_dim = None;
+
+        let parts: Vec<&str> = content.split('-').collect();
+        let mut i = 0;
+        while i < parts.len() {
+            match parts[i].trim() {
+                "heads" => {
+                    if i + 1 < parts.len() {
+                        heads = Some(Self::parse_u64(parts[i + 1], "heads value")?);
+                        i += 2;
+                    } else {
+                        return Err("heads requires a value".into());
+                    }
+                }
+                "dim" => {
+                    if i + 1 < parts.len() {
+                        dim = Some(Self::parse_u64(parts[i + 1], "dim value")?);
+                        i += 2;
+                    } else {
+                        return Err("dim requires a value".into());
+                    }
+                }
+                "depth" | "layers" => {
+                    if i + 1 < parts.len() {
+                        depth = Some(Self::parse_u64(parts[i + 1], "depth value")?);
+                        i += 2;
+                    } else {
+                        return Err("depth requires a value".into());
+                    }
+                }
+                "ff" => {
+                    if i + 1 < parts.len() {
+                        ff_dim = Some(Self::parse_u64(parts[i + 1], "ff value")?);
+                        i += 2;
+                    } else {
+                        return Err("ff requires a value".into());
+                    }
+                }
+                _ => {
+                    return Err(format!("unknown transformer param `{}`", parts[i]));
+                }
+            }
+        }
+
+        let heads = heads.ok_or("Transformer must specify heads-N")?;
+        let dim = dim.ok_or("Transformer must specify dim-D")?;
+        let depth = depth.unwrap_or(6);
+        let ff_dim = ff_dim.unwrap_or_else(|| dim * 4);
+
+        if heads == 0 || dim == 0 || depth == 0 {
+            return Err("Transformer parameters must be > 0".into());
+        }
+
+        Ok(AiArchitectureSpec::Transformer {
+            heads,
+            dim,
+            depth,
+            ff_dim,
+            learning: LearningConfig::default(),
+        })
+    }
+
+    fn apply_learning_config_to_spec(spec: &mut Self, cfg: &str) -> Result<(), String> {
+        let parts: Vec<&str> = cfg.split('-').collect();
+        let mut i = 0;
+
+        let mut config = match spec {
+            AiArchitectureSpec::Mlp { learning, .. } => learning.clone(),
+            AiArchitectureSpec::Lstm { learning, .. } => learning.clone(),
+            AiArchitectureSpec::Cnn { learning, .. } => learning.clone(),
+            AiArchitectureSpec::Dueling { learning, .. } => learning.clone(),
+            AiArchitectureSpec::Transformer { learning, .. } => learning.clone(),
+        };
+
+        while i < parts.len() {
+            match parts[i] {
+                "opt" => {
+                    if i + 1 < parts.len() {
+                        config.optimizer = match parts[i + 1].to_lowercase().as_str() {
+                            "adam" => OptimizerType::Adam,
+                            "adamw" => OptimizerType::AdamW,
+                            "sgd" => OptimizerType::Sgd,
+                            "rmsprop" => OptimizerType::Rmsprop,
+                            "lamb" => OptimizerType::Lamb,
+                            opt => return Err(format!(
+                                "unknown optimizer `{}`. Supported: adam, adamw, sgd, rmsprop, lamb",
+                                opt
+                            )),
+                        };
+                        i += 2;
+                    } else {
+                        return Err("opt requires a value".into());
+                    }
+                }
+                "lr" => {
+                    if i + 1 < parts.len() {
+                        let lr: f32 = parts[i + 1].parse()
+                            .map_err(|_| format!("invalid learning rate `{}`", parts[i + 1]))?;
+                        if lr <= 0.0 || lr > 0.1 {
+                            return Err("learning rate must be in (0, 0.1]".into());
+                        }
+                        config.learning_rate = lr;
+                        i += 2;
+                    } else {
+                        return Err("lr requires a value".into());
+                    }
+                }
+                "explore" => {
+                    if i + 1 < parts.len() {
+                        config.exploration_strategy = match parts[i + 1].to_lowercase().as_str() {
+                            "epsilon" => ExplorationStrategy::Epsilon,
+                            "ucb" => ExplorationStrategy::Ucb,
+                            "boltzmann" => ExplorationStrategy::Boltzmann,
+                            strategy => return Err(format!(
+                                "unknown exploration strategy `{}`. Supported: epsilon, ucb, boltzmann",
+                                strategy
+                            )),
+                        };
+                        i += 2;
+                    } else {
+                        return Err("explore requires a value".into());
+                    }
+                }
+                "gamma" => {
+                    if i + 1 < parts.len() {
+                        let g: f32 = parts[i + 1].parse()
+                            .map_err(|_| format!("invalid gamma value `{}`", parts[i + 1]))?;
+                        if g < 0.0 || g > 1.0 {
+                            return Err("gamma must be in [0, 1]".into());
+                        }
+                        config.gamma = g;
+                        i += 2;
+                    } else {
+                        return Err("gamma requires a value".into());
+                    }
+                }
+                "epsilon" => {
+                    if i + 1 < parts.len() {
+                        let eps: f32 = parts[i + 1].parse()
+                            .map_err(|_| format!("invalid epsilon value `{}`", parts[i + 1]))?;
+                        if eps < 0.0 || eps > 1.0 {
+                            return Err("epsilon must be in [0, 1]".into());
+                        }
+                        config.epsilon = Some(eps);
+                        i += 2;
+                    } else {
+                        return Err("epsilon requires a value".into());
+                    }
+                }
+                "temp" => {
+                    if i + 1 < parts.len() {
+                        let t: f32 = parts[i + 1].parse()
+                            .map_err(|_| format!("invalid temperature value `{}`", parts[i + 1]))?;
+                        if t <= 0.0 {
+                            return Err("temperature must be > 0".into());
+                        }
+                        config.temperature = Some(t);
+                        i += 2;
+                    } else {
+                        return Err("temp requires a value".into());
+                    }
+                }
+                _ => {
+                    return Err(format!("unknown learning config parameter `{}`", parts[i]));
+                }
+            }
+        }
+
+        // Apply updated config back to spec
+        match spec {
+            AiArchitectureSpec::Mlp { learning, .. } => *learning = config,
+            AiArchitectureSpec::Lstm { learning, .. } => *learning = config,
+            AiArchitectureSpec::Cnn { learning, .. } => *learning = config,
+            AiArchitectureSpec::Dueling { learning, .. } => *learning = config,
+            AiArchitectureSpec::Transformer { learning, .. } => *learning = config,
+        }
+
+        Ok(())
+    }
+
+    fn to_model_decl(&self, agent_name: &str, _span: Span) -> ModelDecl {
+        let model_name = format!("{}Brain", agent_name);
+        let mut model_layers = Vec::new();
+
+        // Add input layer
+        let input_size = match self {
+            AiArchitectureSpec::Mlp { layers, .. } => layers.first().cloned().unwrap_or(256),
+            AiArchitectureSpec::Lstm { units, .. } => units.first().cloned().unwrap_or(256),
+            AiArchitectureSpec::Cnn { .. } => 224, // Default image size
+            AiArchitectureSpec::Dueling { input_size, .. } => *input_size,
+            AiArchitectureSpec::Transformer { dim, .. } => *dim,
+        };
+
+        model_layers.push(ModelLayer::Input {
+            span: Span::dummy(),
+            size: input_size,
+        });
+
+        // Add network-specific layers
+        match self {
+            AiArchitectureSpec::Mlp { layers, activations, .. } => {
+                for i in 1..layers.len() {
+                    model_layers.push(ModelLayer::Dense {
+                        span: Span::dummy(),
+                        units: layers[i],
+                        activation: self.activation_to_enum(activations.get(i).cloned().unwrap_or(ActivationType::Relu)),
+                        bias: true,
                     });
-                comp.cloned()
-                    .ok_or_else(|| RuntimeError::new(format!(
-                        "entity has no component `{field}`"
-                    )))
+                }
             }
-            Value::Vec2(v) => swizzle_vec(&v, field).map_err(RuntimeError::new),
-            Value::Vec3(v) => swizzle_vec(&v, field).map_err(RuntimeError::new),
-            Value::Vec4(v) => swizzle_vec(&v, field).map_err(RuntimeError::new),
-            Value::Quat(q) => match field {
-                "x" => Ok(Value::F32(q[0])),
-                "y" => Ok(Value::F32(q[1])),
-                "z" => Ok(Value::F32(q[2])),
-                "w" => Ok(Value::F32(q[3])),
-                _ => rt_err!("quat has no field `{field}`"),
-            },
-            Value::Tuple(vs) => {
-                let idx: usize = field.parse()
-                    .map_err(|_| RuntimeError::new(format!("bad tuple field `{field}`")))?;
-                vs.into_iter().nth(idx)
-                    .ok_or_else(|| RuntimeError::new(format!("tuple index {idx} out of range")))
+            AiArchitectureSpec::Lstm { units, activations, .. } => {
+                for i in 1..units.len() {
+                    model_layers.push(ModelLayer::Dense {
+                        span: Span::dummy(),
+                        units: units[i],
+                        activation: self.activation_to_enum(activations.get(i).cloned().unwrap_or(ActivationType::Tanh)),
+                        bias: true,
+                    });
+                }
             }
-            other => rt_err!("`{}` has no field `{field}`", other.type_name()),
+            AiArchitectureSpec::Cnn { filters, kernel_size, activations, .. } => {
+                for (i, &num_filters) in filters.iter().enumerate() {
+                    model_layers.push(ModelLayer::Conv2d {
+                        span: Span::dummy(),
+                        filters: num_filters,
+                        kernel_h: *kernel_size,
+                        kernel_w: *kernel_size,
+                        activation: self.activation_to_enum(activations.get(i).cloned().unwrap_or(ActivationType::Relu)),
+                        stride: 1,
+                        padding: Padding::Same,
+                    });
+                }
+            }
+            AiArchitectureSpec::Transformer { heads, dim, depth, .. } => {
+                for _ in 0..*depth {
+                    model_layers.push(ModelLayer::Attention {
+                        span: Span::dummy(),
+                        num_heads: *heads,
+                        head_dim: dim / heads,
+                    });
+                }
+            }
+            AiArchitectureSpec::Dueling { .. } => {}
+        }
+
+        // Add output layer
+        let output_size = match self {
+            AiArchitectureSpec::Mlp { output_size, .. } => *output_size,
+            AiArchitectureSpec::Lstm { output_size, .. } => *output_size,
+            AiArchitectureSpec::Cnn { output_size, .. } => *output_size,
+            AiArchitectureSpec::Dueling { policy_units, .. } => *policy_units,
+            AiArchitectureSpec::Transformer { dim, .. } => *dim,
+        };
+
+        model_layers.push(ModelLayer::Output {
+            span: Span::dummy(),
+            units: output_size,
+            activation: Activation::Softmax,
+        });
+
+        ModelDecl {
+            span: Span::dummy(),
+            attrs: vec![Attribute::Grad],
+            name: model_name,
+            layers: model_layers,
+            device: ModelDevice::Auto,
+            optimizer: None,
         }
     }
 
-    fn eval_index(&self, obj: Value, indices: Vec<Value>) -> Result<Value, RuntimeError> {
-        match obj {
-            Value::Array(arr) => {
-                let idx = indices.first().and_then(|v| v.as_i64()).unwrap_or(0) as usize;
-                let a = arr.lock().unwrap();
-                a.get(idx).cloned()
-                    .ok_or_else(|| RuntimeError::new(format!("index {idx} out of bounds")))
+    fn activation_to_enum(&self, act: ActivationType) -> Activation {
+        match act {
+            ActivationType::Relu => Activation::Relu,
+            ActivationType::LeakyRelu => Activation::LeakyRelu,
+            ActivationType::Tanh => Activation::Tanh,
+            ActivationType::Sigmoid => Activation::Sigmoid,
+            ActivationType::Gelu => Activation::Gelu,
+            ActivationType::Elu => Activation::Elu,
+            ActivationType::Swish => Activation::Swish,
+            ActivationType::Mish => Activation::Mish,
+            ActivationType::Softmax => Activation::Softmax,
+            ActivationType::Linear => Activation::Linear,
+        }
+    }
+}
+
             }
             Value::Tensor(t) => {
                 let t = t.read().unwrap();
