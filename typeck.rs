@@ -2641,14 +2641,13 @@ impl TypeCk {
     // =========================================================================
 
     fn check_agent(&mut self, a: &AgentDecl) {
-        // Validate network architecture decorators like:
-        // @AI("128->64->32"), @PPO(128->64->32), @DQN(256->128->64)
-        for attr in &a.attrs {
-            if let crate::ast::Attribute::Named { name, .. } = attr {
-                if is_network_decorator(name) {
-                    self.validate_network_decorator(a, attr, name);
-                }
-            }
+        // ─── NEW: Validate @AI decorator if present ───────────────────────────
+        if let Some(ai_attr) = a
+            .attrs
+            .iter()
+            .find(|attr| matches!(attr, crate::ast::Attribute::Named { name, .. } if name == "ai"))
+        {
+            self.validate_ai_decorator(a, ai_attr);
         }
 
         // If learning is reinforcement/imitation, there should be a policy model.
@@ -2783,18 +2782,10 @@ impl TypeCk {
                     }
                 } else {
                     self.diag
-                        .error(*span, format!("@{} architecture format is invalid", decorator_name.to_uppercase()));
+                        .error(*span, "@AI architecture string format is invalid");
                 }
             } else {
-                self.diag.error(
-                    a.span,
-                    format!(
-                        "@{} requires an architecture argument, e.g. @{}(256->128->64) or @{}(\"256->128->64\")",
-                        decorator_name.to_uppercase(),
-                        decorator_name.to_uppercase(),
-                        decorator_name.to_uppercase()
-                    ),
-                );
+                self.diag.error(a.span, "@AI decorator requires a string literal argument (e.g., @AI(\"256->512->10\"))");
             }
         }
     }

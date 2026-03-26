@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 // GPU buffer handle (opaque to users)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -164,57 +163,11 @@ impl GpuBackendImpl for CpuBackend {
         }
 
         let mut out_data = vec![0.0f32; m * n];
-        let b_t = transpose_2d(&buf_b.data, k, n);
-
-        let ops = m.saturating_mul(k).saturating_mul(n);
-        let threads = thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        let use_blocked = m >= 64 && k >= 64 && n >= 64;
-
-        if threads > 1 && ops >= 1_000_000 {
-            let rows_per_chunk = m.div_ceil(threads);
-            thread::scope(|scope| {
-                for (chunk_idx, out_chunk) in out_data.chunks_mut(rows_per_chunk * n).enumerate() {
-                    let row_start = chunk_idx * rows_per_chunk;
-                    let row_end = (row_start + rows_per_chunk).min(m);
-                    let a_data = &buf_a.data;
-                    let bt_data = &b_t;
-
-                    scope.spawn(move || {
-                        if use_blocked {
-                            matmul_blocked_rows(
-                                a_data,
-                                bt_data,
-                                row_start,
-                                row_end,
-                                k,
-                                n,
-                                out_chunk,
-                                row_start,
-                            );
-                        } else {
-                            for row in row_start..row_end {
-                                let local_row = row - row_start;
-                                let out_row = &mut out_chunk[local_row * n..(local_row + 1) * n];
-                                let a_row = &a_data[row * k..(row + 1) * k];
-                                for col in 0..n {
-                                    let b_row = &bt_data[col * k..(col + 1) * k];
-                                    out_row[col] = dot_unrolled_8(a_row, b_row);
-                                }
-                            }
-                        }
-                    });
-                }
-            });
-        } else if use_blocked {
-            matmul_blocked_rows(&buf_a.data, &b_t, 0, m, k, n, &mut out_data, 0);
-        } else {
-            for i in 0..m {
-                let a_row = &buf_a.data[i * k..(i + 1) * k];
+        for i in 0..m {
+            for p in 0..k {
+                let a_val = buf_a.data[i * k + p];
                 for j in 0..n {
-                    let b_row = &b_t[j * k..(j + 1) * k];
-                    out_data[i * n + j] = dot_unrolled_8(a_row, b_row);
+                    out_data[i * n + j] += a_val * buf_b.data[p * n + j];
                 }
             }
         }

@@ -256,8 +256,6 @@ impl Tensor {
             .map(|n| n.get())
             .unwrap_or(1);
 
-        let use_blocked = m >= 64 && k >= 64 && n >= 64;
-
         if threads > 1 && ops >= Self::PARALLEL_MATMUL_MIN_OPS {
             let rows_per_chunk = m.div_ceil(threads);
             thread::scope(|scope| {
@@ -268,41 +266,24 @@ impl Tensor {
                     let bt_data = &other_t;
 
                     scope.spawn(move || {
-                        if use_blocked {
-                            matmul_blocked_rows(
-                                a_data,
-                                bt_data,
-                                row_start,
-                                row_end,
-                                k,
-                                n,
-                                result_chunk,
-                                row_start,
-                            );
-                        } else {
-                            for row in row_start..row_end {
-                                let local_row = row - row_start;
-                                let out_row = &mut result_chunk[local_row * n..(local_row + 1) * n];
-                                let a_row = &a_data[row * k..(row + 1) * k];
-                                for col in 0..n {
-                                    let b_row = &bt_data[col * k..(col + 1) * k];
-                                    out_row[col] = dot_unrolled_8(a_row, b_row);
-                                }
+                        for row in row_start..row_end {
+                            let local_row = row - row_start;
+                            let out_row = &mut result_chunk[local_row * n..(local_row + 1) * n];
+                            let a_row = &a_data[row * k..(row + 1) * k];
+                            for col in 0..n {
+                                let b_row = &bt_data[col * k..(col + 1) * k];
+                                out_row[col] = dot_unrolled_8(a_row, b_row);
                             }
                         }
                     });
                 }
             });
         } else {
-            if use_blocked {
-                matmul_blocked_rows(&self.data, &other_t, 0, m, k, n, &mut result, 0);
-            } else {
-                for i in 0..m {
-                    let a_row = &self.data[i * k..(i + 1) * k];
-                    for j in 0..n {
-                        let b_row = &other_t[j * k..(j + 1) * k];
-                        result[i * n + j] = dot_unrolled_8(a_row, b_row);
-                    }
+            for i in 0..m {
+                let a_row = &self.data[i * k..(i + 1) * k];
+                for j in 0..n {
+                    let b_row = &other_t[j * k..(j + 1) * k];
+                    result[i * n + j] = dot_unrolled_8(a_row, b_row);
                 }
             }
         }
@@ -552,6 +533,50 @@ fn matmul_blocked_rows(
             }
         }
     }
+}
+
+fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
+    let len = lhs.len();
+    let chunks = len / 8;
+    let mut i = 0;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let mut s4 = 0.0f32;
+    let mut s5 = 0.0f32;
+    let mut s6 = 0.0f32;
+    let mut s7 = 0.0f32;
+
+    for _ in 0..chunks {
+        s0 += lhs[i] * rhs[i];
+        s1 += lhs[i + 1] * rhs[i + 1];
+        s2 += lhs[i + 2] * rhs[i + 2];
+        s3 += lhs[i + 3] * rhs[i + 3];
+        s4 += lhs[i + 4] * rhs[i + 4];
+        s5 += lhs[i + 5] * rhs[i + 5];
+        s6 += lhs[i + 6] * rhs[i + 6];
+        s7 += lhs[i + 7] * rhs[i + 7];
+        i += 8;
+    }
+
+    let mut tail = 0.0f32;
+    while i < len {
+        tail += lhs[i] * rhs[i];
+        i += 1;
+    }
+
+    s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + tail
+}
+
+fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = data[r * cols + c];
+        }
+    }
+    out
 }
 
 fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
