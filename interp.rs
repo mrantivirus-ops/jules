@@ -37,7 +37,7 @@ use crate::ast::{
     ParallelismHint, Pattern, PoolOp, Program, RecurrentCell, ScheduleKind, Stmt, SystemDecl,
     TrainDecl, UnOpKind, VecSize,
 };
-use crate::game_systems::{create_cube_mesh, InputState, PhysicsShape, PhysicsWorld, RenderState, SceneObjectKind};
+use crate::game_systems::{InputState, PhysicsShape, PhysicsWorld, RenderState};
 use crate::lexer::Span;
 use crate::ml_engine::{ComputationGraph, Optimizer, OptimizerState};
 
@@ -2819,10 +2819,13 @@ impl Interpreter {
                     rt_err!("graphics::set_camera requires (x, y, z)")
                 }
             }
-            "graphics::create_mesh" => {
-                if let (Some(Value::Str(mesh_type)), Some(scale)) =
-                    (args.get(0), args.get(1).and_then(|v| v.as_f64()))
-                {
+            "graphics::set_chunked_grid_cell" => {
+                if let (Some(map_id), Some(x), Some(y), Some(object_id)) = (
+                    args.get(0).and_then(|v| v.as_i64()),
+                    args.get(1).and_then(|v| v.as_i64()),
+                    args.get(2).and_then(|v| v.as_i64()),
+                    args.get(3).and_then(|v| v.as_i64()),
+                ) {
                     let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
                     let s = scale as f32;
                     let vertices = vec![[-s, -s, 0.0], [s, -s, 0.0], [s, s, 0.0], [-s, s, 0.0]];
@@ -2859,212 +2862,6 @@ impl Interpreter {
                     Ok(Value::Bool(false))
                 } else {
                     rt_err!("graphics::render_mesh requires (mesh_id, material_id)")
-                }
-            }
-            "graphics::create_sprite" => {
-                if let (Some(Value::Str(name)), Some(w), Some(h)) = (
-                    args.get(0),
-                    args.get(1).and_then(|v| v.as_f64()),
-                    args.get(2).and_then(|v| v.as_f64()),
-                ) {
-                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    let id = render.create_sprite(name.clone(), w as f32, h as f32);
-                    Ok(Value::I64(id as i64))
-                } else {
-                    rt_err!("graphics::create_sprite requires (name, width, height)")
-                }
-            }
-            "graphics::create_model" => {
-                if let (Some(Value::Str(name)), Some(mesh_id)) =
-                    (args.get(0), args.get(1).and_then(|v| v.as_i64()))
-                {
-                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    match render.create_model(name.clone(), mesh_id as u32) {
-                        Ok(id) => Ok(Value::I64(id as i64)),
-                        Err(e) => rt_err!("{}", e),
-                    }
-                } else {
-                    rt_err!("graphics::create_model requires (name, mesh_id)")
-                }
-            }
-            "graphics::create_object" => {
-                if let (Some(Value::Str(kind)), Some(asset_id), material_id) = (
-                    args.get(0),
-                    args.get(1).and_then(|v| v.as_i64()),
-                    args.get(2).and_then(|v| v.as_i64()),
-                ) {
-                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    let obj_kind = match kind.as_str() {
-                        "sprite" => crate::game_systems::SceneObjectKind::Sprite(asset_id as u32),
-                        "model" => crate::game_systems::SceneObjectKind::Model(asset_id as u32),
-                        _ => return rt_err!("graphics::create_object kind must be \"sprite\" or \"model\""),
-                    };
-                    match render.create_object(obj_kind, material_id.map(|v| v as u32)) {
-                        Ok(id) => Ok(Value::I64(id as i64)),
-                        Err(e) => rt_err!("{}", e),
-                    }
-                } else {
-                    rt_err!("graphics::create_object requires (kind, asset_id, material_id)")
-                }
-            }
-            "graphics::create_grid_map" => {
-                if let (Some(w), Some(h)) = (
-                    args.get(0).and_then(|v| v.as_i64()),
-                    args.get(1).and_then(|v| v.as_i64()),
-                ) {
-                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    let map_id = render.create_grid_map(w as usize, h as usize);
-                    Ok(Value::I64(map_id as i64))
-                } else {
-                    rt_err!("graphics::create_grid_map requires (width, height)")
-                }
-            }
-            "graphics::create_chunked_grid_map" => {
-                if let (Some(w), Some(h), Some(chunk)) = (
-                    args.get(0).and_then(|v| v.as_i64()),
-                    args.get(1).and_then(|v| v.as_i64()),
-                    args.get(2).and_then(|v| v.as_i64()),
-                ) {
-                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    let map_id = render.create_chunked_grid_map(w as usize, h as usize, chunk as usize);
-                    Ok(Value::I64(map_id as i64))
-                } else {
-                    rt_err!("graphics::create_chunked_grid_map requires (width, height, chunk_size)")
-                }
-            }
-            "graphics::set_grid_cell" => {
-                if let (Some(map_id), Some(x), Some(y), Some(object_id)) = (
-                    args.get(0).and_then(|v| v.as_i64()),
-                    args.get(1).and_then(|v| v.as_i64()),
-                    args.get(2).and_then(|v| v.as_i64()),
-                    args.get(3).and_then(|v| v.as_i64()),
-                ) {
-                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    match render.set_grid_cell(map_id as u32, x as usize, y as usize, object_id as u32) {
-                        Ok(()) => Ok(Value::Bool(true)),
-                        Err(e) => rt_err!("{}", e),
-                    }
-                } else {
-                    rt_err!("graphics::set_grid_cell requires (map_id, x, y, object_id)")
-                }
-            }
-            "graphics::set_chunked_grid_cell" => {
-                if let (Some(map_id), Some(x), Some(y), Some(object_id)) = (
-                    args.get(0).and_then(|v| v.as_i64()),
-                    args.get(1).and_then(|v| v.as_i64()),
-                    args.get(2).and_then(|v| v.as_i64()),
-                    args.get(3).and_then(|v| v.as_i64()),
-                ) {
-                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    match render.set_chunked_grid_cell(map_id as u32, x as usize, y as usize, object_id as u32) {
-                        Ok(()) => Ok(Value::Bool(true)),
-                        Err(e) => rt_err!("{}", e),
-                    }
-                } else {
-                    rt_err!("graphics::set_chunked_grid_cell requires (map_id, x, y, object_id)")
-                }
-            }
-            "graphics::render_grid_map" => {
-                if let Some(map_id) = args.get(0).and_then(|v| v.as_i64()) {
-                    let render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    match render.render_grid_map(map_id as u32) {
-                        Ok(drawn) => Ok(Value::I64(drawn as i64)),
-                        Err(e) => rt_err!("{}", e),
-                    }
-                } else {
-                    rt_err!("graphics::render_grid_map requires (map_id)")
-                }
-            }
-            "graphics::render_chunked_grid_map" => {
-                if let Some(map_id) = args.get(0).and_then(|v| v.as_i64()) {
-                    let render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    match render.render_chunked_grid_map(map_id as u32) {
-                        Ok(drawn) => Ok(Value::I64(drawn as i64)),
-                        Err(e) => rt_err!("{}", e),
-                    }
-                } else {
-                    rt_err!("graphics::render_chunked_grid_map requires (map_id)")
-                }
-            }
-            "game::make_object" => {
-                if let (Some(Value::Str(kind)), Some(Value::Str(name)), Some(size), Some(r), Some(g), Some(b), Some(a)) = (
-                    args.get(0),
-                    args.get(1),
-                    args.get(2).and_then(|v| v.as_f64()),
-                    args.get(3).and_then(|v| v.as_f64()),
-                    args.get(4).and_then(|v| v.as_f64()),
-                    args.get(5).and_then(|v| v.as_f64()),
-                    args.get(6).and_then(|v| v.as_f64()),
-                ) {
-                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    let mat = render.create_material([r as f32, g as f32, b as f32, a as f32]);
-                    let obj_id = match kind.as_str() {
-                        "sprite" => {
-                            let sprite_id = render.create_sprite(name.clone(), size as f32, size as f32);
-                            render.create_object(SceneObjectKind::Sprite(sprite_id), Some(mat))
-                        }
-                        "model" => {
-                            let cube = create_cube_mesh(size as f32);
-                            let mesh_id = render.create_mesh(cube.vertices, cube.indices);
-                            let model_id = render.create_model(name.clone(), mesh_id);
-                            match model_id {
-                                Ok(mid) => render.create_object(SceneObjectKind::Model(mid), Some(mat)),
-                                Err(e) => return rt_err!("{}", e),
-                            }
-                        }
-                        _ => return rt_err!("game::make_object kind must be \"sprite\" or \"model\""),
-                    };
-                    match obj_id {
-                        Ok(id) => Ok(Value::I64(id as i64)),
-                        Err(e) => rt_err!("{}", e),
-                    }
-                } else {
-                    rt_err!("game::make_object requires (kind, name, size, r, g, b, a)")
-                }
-            }
-            "game::build_map" => {
-                if let (Some(w), Some(h), Some(Value::Array(cells))) = (
-                    args.get(0).and_then(|v| v.as_i64()),
-                    args.get(1).and_then(|v| v.as_i64()),
-                    args.get(2),
-                ) {
-                    let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    let width = w as usize;
-                    let height = h as usize;
-                    let map_id = render.create_grid_map(width, height);
-                    let cells_guard = cells.lock().unwrap();
-                    let max_cells = width.saturating_mul(height).min(cells_guard.len());
-                    for idx in 0..max_cells {
-                        let object_id = cells_guard[idx].as_i64().unwrap_or(0).max(0) as u32;
-                        let x = idx % width;
-                        let y = idx / width;
-                        let _ = render.set_grid_cell(map_id, x, y, object_id);
-                    }
-                    Ok(Value::I64(map_id as i64))
-                } else {
-                    rt_err!("game::build_map requires (width, height, cells_array)")
-                }
-            }
-            "game::run_loop" => {
-                if let (Some(map_id), Some(ticks), Some(dt)) = (
-                    args.get(0).and_then(|v| v.as_i64()),
-                    args.get(1).and_then(|v| v.as_i64()),
-                    args.get(2).and_then(|v| v.as_f64()),
-                ) {
-                    let mut frames_drawn = 0i64;
-                    for _ in 0..ticks.max(0) {
-                        if let Some(world) = &self.physics_world {
-                            world.lock().unwrap().step(dt as f32);
-                        }
-                        if let Some(render) = &self.render_state {
-                            if let Ok(count) = render.lock().unwrap().render_grid_map(map_id as u32) {
-                                frames_drawn += count as i64;
-                            }
-                        }
-                    }
-                    Ok(Value::I64(frames_drawn))
-                } else {
-                    rt_err!("game::run_loop requires (map_id, ticks, dt)")
                 }
             }
             "graphics::clear" => Ok(Value::Bool(true)),
