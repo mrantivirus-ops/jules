@@ -46,9 +46,9 @@ impl Watcher {
         }
         drop(w);
         if !to_call.is_empty() {
-            let cbs = self.callbacks.lock().unwrap().clone();
+            let callbacks = self.callbacks.lock().unwrap();
             for p in to_call {
-                for cb in &cbs {
+                for cb in callbacks.iter() {
                     cb(&p);
                 }
             }
