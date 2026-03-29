@@ -2775,6 +2775,8 @@ mod tests {
             model: None,
             optimizer: None,
             hyper: vec![],
+            algorithm: None,
+            value_model: None,
         };
         let mut ctx = SemaCtx::new();
         ctx.analyse_train(&t);
@@ -2800,6 +2802,8 @@ mod tests {
             model: None,
             optimizer: None,
             hyper: vec![],
+            algorithm: None,
+            value_model: None,
         };
         let mut ctx = SemaCtx::new();
         ctx.analyse_train(&t);
@@ -2860,6 +2864,8 @@ mod tests {
             model: None,
             optimizer: None,
             hyper: vec![],
+            algorithm: None,
+            value_model: None,
         };
         let mut ctx = SemaCtx::new();
         ctx.analyse_train(&t);
@@ -2885,6 +2891,8 @@ mod tests {
             model: None,
             optimizer: None,
             hyper: vec![],
+            algorithm: None,
+            value_model: None,
         };
         let mut ctx = SemaCtx::new();
         ctx.analyse_train(&t);

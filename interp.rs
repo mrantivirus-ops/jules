@@ -2874,14 +2874,17 @@ impl Interpreter {
                     args.get(3).and_then(|v| v.as_i64()),
                 ) {
                     let mut render = self.render_state.as_ref().unwrap().lock().unwrap();
-                    let s = scale as f32;
-                    let vertices = vec![[-s, -s, 0.0], [s, -s, 0.0], [s, s, 0.0], [-s, s, 0.0]];
-                    let indices = vec![0, 1, 2, 0, 2, 3];
-                    let mesh_id = render.create_mesh(vertices, indices);
-                    let _ = mesh_type;
-                    Ok(Value::I64(mesh_id as i64))
+                    match render.set_chunked_grid_cell(
+                        map_id as u32,
+                        x as usize,
+                        y as usize,
+                        object_id as u32,
+                    ) {
+                        Ok(()) => Ok(Value::Bool(true)),
+                        Err(e) => rt_err!("graphics::set_chunked_grid_cell failed: {}", e),
+                    }
                 } else {
-                    rt_err!("graphics::create_mesh requires (type_str, scale)")
+                    rt_err!("graphics::set_chunked_grid_cell requires (map_id, x, y, object_id)")
                 }
             }
             "graphics::create_material" => {

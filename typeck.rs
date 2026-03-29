@@ -2807,6 +2807,62 @@ impl TypeCk {
         }
     }
 
+    fn validate_ai_decorator(&mut self, a: &AgentDecl, attr: &crate::ast::Attribute) {
+        let crate::ast::Attribute::Named { args, .. } = attr else {
+            return;
+        };
+
+        // Optional positional first arg: network architecture string.
+        if let Some(first) = args.first() {
+            if let crate::ast::Expr::StrLit { value, span } = first {
+                if let Err(e) = self.validate_architecture_string(value) {
+                    self.diag.error(*span, format!("@AI: {}", e));
+                }
+            }
+        }
+
+        for arg in args {
+            if let crate::ast::Expr::Assign { target, value, .. } = arg {
+                let key = match &**target {
+                    crate::ast::Expr::Ident { name, .. } => name.as_str(),
+                    _ => continue,
+                };
+                match key {
+                    "network" => {
+                        if let crate::ast::Expr::StrLit { value: arch, span } = &**value {
+                            if let Err(e) = self.validate_architecture_string(arch) {
+                                self.diag.error(*span, format!("@AI network: {}", e));
+                            }
+                        } else {
+                            self.diag.error(value.span(), "@AI `network` must be a string architecture");
+                        }
+                    }
+                    "lr" | "learning_rate" => {
+                        if let Some(v) = self.ai_number_literal(value) {
+                            if v <= 0.0 {
+                                self.diag.error(value.span(), "@AI learning rate must be > 0");
+                            }
+                        } else {
+                            self.diag.error(value.span(), "@AI learning rate must be numeric");
+                        }
+                    }
+                    "input" | "output" => {
+                        if let Some(v) = self.ai_u64_literal(value) {
+                            if v == 0 {
+                                self.diag.error(value.span(), format!("@AI `{}` must be > 0", key));
+                            }
+                        } else {
+                            self.diag.error(value.span(), format!("@AI `{}` must be an integer", key));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let _ = a;
+    }
+
     /// Validate that an architecture string has valid format
     fn validate_architecture_string(&self, s: &str) -> Result<(), String> {
         let s = s.trim();
@@ -3056,6 +3112,22 @@ mod tests {
 
     fn make_checker() -> TypeCk {
         TypeCk::new()
+    }
+
+
+    fn mk_agent_with_attrs(attrs: Vec<Attribute>) -> AgentDecl {
+        AgentDecl {
+            span: dummy(),
+            attrs,
+            name: "TestAgent".into(),
+            architecture: AgentArchitecture::default(),
+            perceptions: vec![],
+            memory: None,
+            learning: None,
+            behaviors: vec![],
+            goals: vec![],
+            fields: vec![],
+        }
     }
 
     // ── Scalar literal inference ───────────────────────────────────────────────
