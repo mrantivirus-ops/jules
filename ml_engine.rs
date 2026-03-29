@@ -196,6 +196,204 @@ impl Tensor {
         }
     }
 
+    /// LayerNorm over the last dimension.
+    /// `gamma`/`beta` are optional affine params of shape `[last_dim]`.
+    pub fn layer_norm_last_dim(
+        &self,
+        gamma: Option<&Tensor>,
+        beta: Option<&Tensor>,
+        eps: f32,
+    ) -> Result<Tensor, String> {
+        let last_dim = *self
+            .shape
+            .last()
+            .ok_or_else(|| "layer_norm_last_dim expects rank >= 1".to_string())?;
+        if last_dim == 0 {
+            return Err("layer_norm_last_dim last dimension must be > 0".into());
+        }
+        if !eps.is_finite() || eps <= 0.0 {
+            return Err("layer_norm_last_dim eps must be finite and > 0".into());
+        }
+
+        if let Some(g) = gamma {
+            if g.shape != vec![last_dim] {
+                return Err(format!(
+                    "layer_norm_last_dim gamma must be shape [{}]",
+                    last_dim
+                ));
+            }
+        }
+        if let Some(b) = beta {
+            if b.shape != vec![last_dim] {
+                return Err(format!(
+                    "layer_norm_last_dim beta must be shape [{}]",
+                    last_dim
+                ));
+            }
+        }
+
+        let rows = self.data.len() / last_dim;
+        let mut out = vec![0.0f32; self.data.len()];
+        for r in 0..rows {
+            let base = r * last_dim;
+            let row = &self.data[base..base + last_dim];
+            let mean = row.iter().sum::<f32>() / last_dim as f32;
+            let var = row
+                .iter()
+                .map(|v| {
+                    let d = *v - mean;
+                    d * d
+                })
+                .sum::<f32>()
+                / last_dim as f32;
+            let inv_std = 1.0 / (var + eps).sqrt();
+            for i in 0..last_dim {
+                let mut v = (row[i] - mean) * inv_std;
+                if let Some(g) = gamma {
+                    v *= g.data[i];
+                }
+                if let Some(b) = beta {
+                    v += b.data[i];
+                }
+                out[base + i] = v;
+            }
+        }
+        Ok(Tensor {
+            shape: self.shape.clone(),
+            data: out,
+        })
+    }
+
+    /// RMSNorm over the last dimension.
+    /// `weight` is optional scale param of shape `[last_dim]`.
+    pub fn rms_norm_last_dim(&self, weight: Option<&Tensor>, eps: f32) -> Result<Tensor, String> {
+        let last_dim = *self
+            .shape
+            .last()
+            .ok_or_else(|| "rms_norm_last_dim expects rank >= 1".to_string())?;
+        if last_dim == 0 {
+            return Err("rms_norm_last_dim last dimension must be > 0".into());
+        }
+        if !eps.is_finite() || eps <= 0.0 {
+            return Err("rms_norm_last_dim eps must be finite and > 0".into());
+        }
+        if let Some(w) = weight {
+            if w.shape != vec![last_dim] {
+                return Err(format!(
+                    "rms_norm_last_dim weight must be shape [{}]",
+                    last_dim
+                ));
+            }
+        }
+
+        let rows = self.data.len() / last_dim;
+        let mut out = vec![0.0f32; self.data.len()];
+        for r in 0..rows {
+            let base = r * last_dim;
+            let row = &self.data[base..base + last_dim];
+            let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / last_dim as f32;
+            let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+            for i in 0..last_dim {
+                let mut v = row[i] * inv_rms;
+                if let Some(w) = weight {
+                    v *= w.data[i];
+                }
+                out[base + i] = v;
+            }
+        }
+        Ok(Tensor {
+            shape: self.shape.clone(),
+            data: out,
+        })
+    }
+
+    /// Native scaled dot-product attention for tensors shaped:
+    /// - q: [batch, q_len, d]
+    /// - k: [batch, kv_len, d]
+    /// - v: [batch, kv_len, v_dim]
+    pub fn scaled_dot_product_attention(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        causal: bool,
+    ) -> Result<Tensor, String> {
+        if q.shape.len() != 3 || k.shape.len() != 3 || v.shape.len() != 3 {
+            return Err("scaled_dot_product_attention expects rank-3 q,k,v tensors".into());
+        }
+        let (bq, q_len, d) = (q.shape[0], q.shape[1], q.shape[2]);
+        let (bk, kv_len, kd) = (k.shape[0], k.shape[1], k.shape[2]);
+        let (bv, vv_len, v_dim) = (v.shape[0], v.shape[1], v.shape[2]);
+        if bq != bk || bq != bv {
+            return Err("scaled_dot_product_attention batch mismatch".into());
+        }
+        if kd != d {
+            return Err("scaled_dot_product_attention q/k hidden size mismatch".into());
+        }
+        if vv_len != kv_len {
+            return Err("scaled_dot_product_attention k/v sequence mismatch".into());
+        }
+        if d == 0 || v_dim == 0 {
+            return Err("scaled_dot_product_attention dimensions must be > 0".into());
+        }
+
+        let mut out = vec![0.0f32; bq * q_len * v_dim];
+        let scale = 1.0 / (d as f32).sqrt();
+
+        for b in 0..bq {
+            for t in 0..q_len {
+                let q_base = (b * q_len + t) * d;
+                let q_row = &q.data[q_base..q_base + d];
+
+                let mut scores = vec![f32::NEG_INFINITY; kv_len];
+                let mut max_score = f32::NEG_INFINITY;
+                for s in 0..kv_len {
+                    if causal && s > t {
+                        continue;
+                    }
+                    let k_base = (b * kv_len + s) * d;
+                    let k_row = &k.data[k_base..k_base + d];
+                    let mut dot = 0.0f32;
+                    for i in 0..d {
+                        dot += q_row[i] * k_row[i];
+                    }
+                    let score = dot * scale;
+                    scores[s] = score;
+                    if score > max_score {
+                        max_score = score;
+                    }
+                }
+
+                let mut denom = 0.0f32;
+                for s in 0..kv_len {
+                    if scores[s].is_finite() {
+                        scores[s] = (scores[s] - max_score).exp();
+                        denom += scores[s];
+                    } else {
+                        scores[s] = 0.0;
+                    }
+                }
+                let denom = denom.max(1e-12);
+
+                let out_base = (b * q_len + t) * v_dim;
+                for s in 0..kv_len {
+                    let w = scores[s] / denom;
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let v_base = (b * kv_len + s) * v_dim;
+                    for c in 0..v_dim {
+                        out[out_base + c] += w * v.data[v_base + c];
+                    }
+                }
+            }
+        }
+
+        Ok(Tensor {
+            shape: vec![bq, q_len, v_dim],
+            data: out,
+        })
+    }
+
     pub fn sum(&self) -> f32 {
         self.data.iter().sum()
     }
@@ -233,6 +431,14 @@ impl Tensor {
             shape: upstream_grad.shape.clone(),
             data,
         }
+    }
+
+    #[inline]
+    fn use_native_jules_kernel(m: usize, k: usize, n: usize) -> bool {
+        // Native Jules heuristic: route larger or "long-and-skinny" GEMMs
+        // to the in-tree Jules kernel sooner than scalar fallback kernels.
+        let ops = m.saturating_mul(k).saturating_mul(n);
+        ops >= 131_072 || (k >= 256 && (m >= 16 || n >= 16))
     }
 
     /// Matrix multiplication

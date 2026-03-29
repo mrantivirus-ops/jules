@@ -500,6 +500,25 @@ pub struct TypeCk {
 }
 
 impl TypeCk {
+    fn is_runtime_builtin_path(name: &str) -> bool {
+        const PREFIXES: &[&str] = &[
+            "game::",
+            "graphics::",
+            "audio::",
+            "input::",
+            "physics::",
+            "ml::",
+            "loss::",
+            "metrics::",
+            "autodiff::",
+        ];
+        PREFIXES.iter().any(|p| name.starts_with(p))
+    }
+
+    fn is_runtime_builtin_ident(name: &str) -> bool {
+        matches!(name, "println" | "print")
+    }
+
     pub fn new() -> Self {
         TypeCk {
             diag: Diagnostics::default(),
@@ -927,6 +946,9 @@ impl TypeCk {
                 match env.lookup(&name) {
                     Some(ty) => ty.clone(),
                     None => {
+                        if Self::is_runtime_builtin_path(&name) {
+                            return self.infer.fresh();
+                        }
                         // Could be a function reference.
                         if let Some(fi) = self
                             .symbols
@@ -2053,6 +2075,9 @@ impl TypeCk {
                             }
                         }
                         return fi.ret.clone();
+                    }
+                    if Self::is_runtime_builtin_ident(name.as_str()) {
+                        return self.infer.fresh();
                     }
                     // Unknown function — emit error, return fresh var.
                     self.diag
