@@ -3446,8 +3446,6 @@ mod tests_new {
             model: Some("PolicyNet".into()),
             optimizer: None,
             hyper: vec![("gamma".into(), float_lit(0.99))],
-            algorithm: None,
-            value_model: None,
         }
     }
 

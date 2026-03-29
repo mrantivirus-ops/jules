@@ -734,7 +734,7 @@ fn insert_char_at_byte(source: &mut String, byte_idx: usize, ch: char) {
     }
 }
 
-fn apply_safe_syntax_fixes(source: &str, diags: &[Diag], aggressive: bool) -> Option<String> {
+fn apply_safe_syntax_fixes(source: &str, diags: &[Diag]) -> Option<String> {
     let mut out = source.to_string();
     let mut changed = false;
 
@@ -746,34 +746,19 @@ fn apply_safe_syntax_fixes(source: &str, diags: &[Diag], aggressive: bool) -> Op
 
     let mut semicolon_lines = std::collections::BTreeSet::<u32>::new();
     let mut insertions: Vec<(usize, char)> = Vec::new();
-    let mut ambiguous_insertion = false;
 
     for d in diags {
         let Some(span) = d.span else { continue };
         let Some(hint) = d.hint.as_deref() else { continue };
         if hint.contains("add `;` to end this statement") {
             semicolon_lines.insert(span.line);
-        } else if aggressive {
-            if hint.contains("close this expression with `)`") {
-                insertions.push((span.start, ')'));
-            } else if hint.contains("close this index/type with `]`") {
-                insertions.push((span.start, ']'));
-            } else if hint.contains("close this block with `}`") {
-                insertions.push((span.start, '}'));
-            }
+        } else if hint.contains("close this expression with `)`") {
+            insertions.push((span.start, ')'));
+        } else if hint.contains("close this index/type with `]`") {
+            insertions.push((span.start, ']'));
+        } else if hint.contains("close this block with `}`") {
+            insertions.push((span.start, '}'));
         }
-    }
-
-    let mut by_idx = std::collections::HashMap::<usize, char>::new();
-    for (idx, ch) in &insertions {
-        if let Some(existing) = by_idx.insert(*idx, *ch) {
-            if existing != *ch {
-                ambiguous_insertion = true;
-            }
-        }
-    }
-    if ambiguous_insertion {
-        return None;
     }
 
     insertions.sort_by(|a, b| b.0.cmp(&a.0));
@@ -804,20 +789,6 @@ fn apply_safe_syntax_fixes(source: &str, diags: &[Diag], aggressive: bool) -> Op
     changed.then_some(out)
 }
 
-fn print_fix_diff(old: &str, new: &str) {
-    let old_lines: Vec<&str> = old.split('\n').collect();
-    let new_lines: Vec<&str> = new.split('\n').collect();
-    let max = old_lines.len().max(new_lines.len());
-    for i in 0..max {
-        let a = old_lines.get(i).copied().unwrap_or("");
-        let b = new_lines.get(i).copied().unwrap_or("");
-        if a != b {
-            println!("-{:4} {}", i + 1, a);
-            println!("+{:4} {}", i + 1, b);
-        }
-    }
-}
-
 fn cmd_fix(args: &CliArgs) -> i32 {
     let path = match &args.file {
         Some(p) => p,
@@ -839,39 +810,17 @@ fn cmd_fix(args: &CliArgs) -> i32 {
         return 0;
     }
 
-    match apply_safe_syntax_fixes(&source, &unit.diags, args.fix_aggressive) {
+    match apply_safe_syntax_fixes(&source, &unit.diags) {
         Some(fixed) if fixed != source => {
-            if args.fix_diff {
-                print_fix_diff(&source, &fixed);
-            }
-            let changed_lines = source
-                .split('\n')
-                .zip(fixed.split('\n'))
-                .filter(|(a, b)| a != b)
-                .count();
-
-            if args.fix_dry_run {
-                println!(
-                    "jules fix: dry-run; {} line(s) would change in {}",
-                    changed_lines,
-                    path.display()
-                );
-                return 0;
-            }
-
             if let Err(e) = fs::write(path, fixed) {
                 eprintln!("jules fix: failed writing `{}`: {e}", path.display());
                 return 2;
             }
-            println!(
-                "jules fix: applied safe fixes to {} ({} line(s) changed)",
-                path.display(),
-                changed_lines
-            );
+            println!("jules fix: applied safe fixes to {}", path.display());
             0
         }
         _ => {
-            println!("jules fix: no safe automatic fix could be applied (try --aggressive for closer insertion rules)");
+            println!("jules fix: no safe automatic fix could be applied");
             1
         }
     }
@@ -1360,14 +1309,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_fix_flags() {
-        let a = parse(&["fix", "broken.jules", "--dry-run", "--diff", "--aggressive"]).unwrap();
-        assert!(a.fix_dry_run);
-        assert!(a.fix_diff);
-        assert!(a.fix_aggressive);
-    }
-
-    #[test]
     fn test_cli_check_warn_error() {
         let a = parse(&["check", "bar.jules", "-W"]).unwrap();
         assert!(a.warn_as_error);
@@ -1439,7 +1380,7 @@ mod tests {
 
     #[test]
     fn test_apply_safe_syntax_fixes_keyword_typo() {
-        let fixed = apply_safe_syntax_fixes("fun main() {}", &[], false).unwrap();
+        let fixed = apply_safe_syntax_fixes("fun main() {}", &[]).unwrap();
         assert_eq!(fixed, "fn main() {}");
     }
 

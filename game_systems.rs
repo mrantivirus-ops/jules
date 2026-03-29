@@ -300,29 +300,6 @@ pub struct ChunkedGridMap {
     pub chunks: HashMap<(i32, i32), Vec<u32>>,
 }
 
-#[derive(Debug, Clone)]
-pub struct SpriteAnimation {
-    pub id: u32,
-    pub frames: Vec<u32>, // sprite ids
-    pub fps: f32,
-}
-
-#[derive(Debug, Clone)]
-pub struct AudioClip {
-    pub id: u32,
-    pub name: String,
-    pub length_seconds: f32,
-}
-
-#[derive(Debug, Clone)]
-pub struct AudioVoice {
-    pub id: u32,
-    pub clip_id: u32,
-    pub volume: f32,
-    pub looped: bool,
-    pub is_playing: bool,
-}
-
 pub struct RenderState {
     pub camera: Camera,
     pub meshes: HashMap<u32, Mesh>,
@@ -332,9 +309,6 @@ pub struct RenderState {
     pub objects: HashMap<u32, SceneObject>,
     pub maps: HashMap<u32, GridMap>,
     pub chunked_maps: HashMap<u32, ChunkedGridMap>,
-    pub animations: HashMap<u32, SpriteAnimation>,
-    pub audio_clips: HashMap<u32, AudioClip>,
-    pub audio_voices: HashMap<u32, AudioVoice>,
     pub next_id: u32,
     // 8K rendering support
     pub width: u32,
@@ -352,9 +326,6 @@ impl RenderState {
             objects: HashMap::new(),
             maps: HashMap::new(),
             chunked_maps: HashMap::new(),
-            animations: HashMap::new(),
-            audio_clips: HashMap::new(),
-            audio_voices: HashMap::new(),
             next_id: 1,
             width: 1920,
             height: 1080,
@@ -468,25 +439,13 @@ impl RenderState {
         id
     }
 
-    pub fn set_grid_cell(
-        &mut self,
-        map_id: u32,
-        x: usize,
-        y: usize,
-        object_id: u32,
-    ) -> Result<(), String> {
+    pub fn set_grid_cell(&mut self, map_id: u32, x: usize, y: usize, object_id: u32) -> Result<(), String> {
         if object_id != 0 && !self.objects.contains_key(&object_id) {
             return Err(format!("unknown object_id {}", object_id));
         }
-        let map = self
-            .maps
-            .get_mut(&map_id)
-            .ok_or_else(|| format!("unknown map_id {}", map_id))?;
+        let map = self.maps.get_mut(&map_id).ok_or_else(|| format!("unknown map_id {}", map_id))?;
         if x >= map.width || y >= map.height {
-            return Err(format!(
-                "grid index out of bounds ({}, {}) for {}x{}",
-                x, y, map.width, map.height
-            ));
+            return Err(format!("grid index out of bounds ({}, {}) for {}x{}", x, y, map.width, map.height));
         }
         map.cells[y * map.width + x] = object_id;
         Ok(())
@@ -501,10 +460,7 @@ impl RenderState {
     }
 
     pub fn render_grid_map(&self, map_id: u32) -> Result<usize, String> {
-        let map = self
-            .maps
-            .get(&map_id)
-            .ok_or_else(|| format!("unknown map_id {}", map_id))?;
+        let map = self.maps.get(&map_id).ok_or_else(|| format!("unknown map_id {}", map_id))?;
         let mut drawn = 0usize;
         for object_id in &map.cells {
             if *object_id == 0 {
@@ -517,12 +473,7 @@ impl RenderState {
         Ok(drawn)
     }
 
-    pub fn create_chunked_grid_map(
-        &mut self,
-        width: usize,
-        height: usize,
-        chunk_size: usize,
-    ) -> u32 {
+    pub fn create_chunked_grid_map(&mut self, width: usize, height: usize, chunk_size: usize) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
         self.chunked_maps.insert(
@@ -579,110 +530,9 @@ impl RenderState {
             .ok_or_else(|| format!("unknown chunked map_id {}", map_id))?;
         let mut drawn = 0usize;
         for chunk in map.chunks.values() {
-            drawn += chunk
-                .iter()
-                .filter(|&&id| id != 0 && self.objects.contains_key(&id))
-                .count();
+            drawn += chunk.iter().filter(|&&id| id != 0 && self.objects.contains_key(&id)).count();
         }
         Ok(drawn)
-    }
-
-    pub fn create_sprite_animation(&mut self, frames: Vec<u32>, fps: f32) -> Result<u32, String> {
-        if frames.is_empty() {
-            return Err("animation requires at least one frame".into());
-        }
-        if fps <= 0.0 || !fps.is_finite() {
-            return Err("animation fps must be finite and > 0".into());
-        }
-        for sprite_id in &frames {
-            if !self.sprites.contains_key(sprite_id) {
-                return Err(format!(
-                    "unknown sprite_id {} in animation frames",
-                    sprite_id
-                ));
-            }
-        }
-        let id = self.next_id;
-        self.next_id += 1;
-        self.animations
-            .insert(id, SpriteAnimation { id, frames, fps });
-        Ok(id)
-    }
-
-    pub fn animation_frame(&self, animation_id: u32, elapsed_seconds: f32) -> Result<u32, String> {
-        if !elapsed_seconds.is_finite() || elapsed_seconds < 0.0 {
-            return Err("elapsed_seconds must be finite and >= 0".into());
-        }
-        let animation = self
-            .animations
-            .get(&animation_id)
-            .ok_or_else(|| format!("unknown animation_id {}", animation_id))?;
-        let frame_count = animation.frames.len();
-        let idx = ((elapsed_seconds * animation.fps).floor() as usize) % frame_count;
-        Ok(animation.frames[idx])
-    }
-
-    pub fn create_audio_clip(&mut self, name: String, length_seconds: f32) -> Result<u32, String> {
-        if name.trim().is_empty() {
-            return Err("audio clip name cannot be empty".into());
-        }
-        if length_seconds <= 0.0 || !length_seconds.is_finite() {
-            return Err("audio clip length_seconds must be finite and > 0".into());
-        }
-        let id = self.next_id;
-        self.next_id += 1;
-        self.audio_clips.insert(
-            id,
-            AudioClip {
-                id,
-                name,
-                length_seconds,
-            },
-        );
-        Ok(id)
-    }
-
-    pub fn play_audio_clip(
-        &mut self,
-        clip_id: u32,
-        volume: f32,
-        looped: bool,
-    ) -> Result<u32, String> {
-        if !self.audio_clips.contains_key(&clip_id) {
-            return Err(format!("unknown clip_id {}", clip_id));
-        }
-        if !volume.is_finite() || volume < 0.0 {
-            return Err("audio volume must be finite and >= 0".into());
-        }
-        let id = self.next_id;
-        self.next_id += 1;
-        self.audio_voices.insert(
-            id,
-            AudioVoice {
-                id,
-                clip_id,
-                volume,
-                looped,
-                is_playing: true,
-            },
-        );
-        Ok(id)
-    }
-
-    pub fn stop_audio_voice(&mut self, voice_id: u32) -> Result<(), String> {
-        let voice = self
-            .audio_voices
-            .get_mut(&voice_id)
-            .ok_or_else(|| format!("unknown voice_id {}", voice_id))?;
-        voice.is_playing = false;
-        Ok(())
-    }
-
-    pub fn active_audio_voices(&self) -> usize {
-        self.audio_voices
-            .values()
-            .filter(|voice| voice.is_playing)
-            .count()
     }
 }
 
@@ -899,10 +749,7 @@ mod tests {
     #[test]
     fn test_grid_map_with_sprite_and_model_objects() {
         let mut render = RenderState::new();
-        let mesh = render.create_mesh(
-            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            vec![0, 1, 2],
-        );
+        let mesh = render.create_mesh(vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], vec![0, 1, 2]);
         let mat = render.create_material([1.0, 1.0, 1.0, 1.0]);
         let sprite = render.create_sprite("grass".into(), 1.0, 1.0);
         let model = render.create_model("tree".into(), mesh).unwrap();
@@ -947,31 +794,6 @@ mod tests {
                 .len(),
             2
         );
-    }
-
-    #[test]
-    fn test_animation_and_audio_helpers() {
-        let mut render = RenderState::new();
-        let s1 = render.create_sprite("idle_0".into(), 1.0, 1.0);
-        let s2 = render.create_sprite("idle_1".into(), 1.0, 1.0);
-        let anim = render
-            .create_sprite_animation(vec![s1, s2], 10.0)
-            .expect("animation created");
-
-        let frame_t0 = render.animation_frame(anim, 0.0).expect("frame at t0");
-        let frame_t015 = render.animation_frame(anim, 0.15).expect("frame at t");
-        assert_eq!(frame_t0, s1);
-        assert_eq!(frame_t015, s2);
-
-        let clip = render
-            .create_audio_clip("laser".into(), 0.5)
-            .expect("clip created");
-        let voice = render
-            .play_audio_clip(clip, 0.8, false)
-            .expect("voice started");
-        assert_eq!(render.active_audio_voices(), 1);
-        render.stop_audio_voice(voice).expect("voice stop");
-        assert_eq!(render.active_audio_voices(), 0);
     }
 }
 

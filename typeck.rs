@@ -935,9 +935,6 @@ impl TypeCk {
             Expr::Ident { span, name } => match env.lookup(name) {
                 Some(ty) => ty.clone(),
                 None => {
-                    if Self::is_runtime_builtin_ident(name.as_str()) {
-                        return self.infer.fresh();
-                    }
                     self.diag
                         .error(*span, format!("use of undeclared variable `{}`", name));
                     self.infer.fresh()
@@ -2085,11 +2082,6 @@ impl TypeCk {
                     // Unknown function — emit error, return fresh var.
                     self.diag
                         .error(span, format!("call to undeclared function `{}`", name));
-                } else if let Expr::Path { segments, .. } = func {
-                    let full = segments.join("::");
-                    if Self::is_runtime_builtin_path(&full) {
-                        return self.infer.fresh();
-                    }
                 } else {
                     self.diag.error(
                         span,
@@ -2674,14 +2666,13 @@ impl TypeCk {
     // =========================================================================
 
     fn check_agent(&mut self, a: &AgentDecl) {
-        // Validate network architecture decorators like:
-        // @AI("128->64->32"), @PPO(128->64->32), @DQN(256->128->64)
-        for attr in &a.attrs {
-            if let crate::ast::Attribute::Named { name, .. } = attr {
-                if is_network_decorator(name) {
-                    self.validate_network_decorator(a, attr, name);
-                }
-            }
+        // ─── NEW: Validate @AI decorator if present ───────────────────────────
+        if let Some(ai_attr) = a
+            .attrs
+            .iter()
+            .find(|attr| matches!(attr, crate::ast::Attribute::Named { name, .. } if name == "ai"))
+        {
+            self.validate_ai_decorator(a, ai_attr);
         }
 
         // If learning is reinforcement/imitation, there should be a policy model.
@@ -2777,192 +2768,51 @@ impl TypeCk {
         attr: &crate::ast::Attribute,
         decorator_name: &str,
     ) {
-        let Some(cfg) = self.extract_ai_decorator_config(a, attr, decorator_name) else {
-            return;
-        };
-
-        if let Err(e) = self.validate_architecture_string(&cfg.network) {
-            self.diag.error(
-                cfg.span,
-                format!("@{}: {}", decorator_name.to_uppercase(), e),
-            );
-            return;
-        }
-
-        let layers = match self.extract_layers_from_arch(&cfg.network) {
-            Ok(layers) => layers,
-            Err(_) => {
-                self.diag.error(
-                    cfg.span,
-                    format!(
-                        "@{} architecture format is invalid",
-                        decorator_name.to_uppercase()
-                    ),
-                );
-                return;
-            }
-        };
-
-        // Calculate total perception size
-        let total_perception_size: u64 = a
-            .perceptions
-            .iter()
-            .map(|p| match &p.range {
-                Some(r) => *r as u64,
-                None => 1,
-            })
-            .sum();
-
-        // Check if input layer matches perception size
-        if let Some(input_size) = layers.first() {
-            if *input_size != total_perception_size {
-                self.diag.error(
-                    cfg.span,
-                    format!(
-                        "@AI input layer size {} doesn't match total perception size {}. \
-                     Perceptions: {}",
-                        *input_size,
-                        total_perception_size,
-                        a.perceptions
-                            .iter()
-                            .map(|p| format!(
-                                "{} ({})",
-                                p.tag.as_deref().unwrap_or("perception"),
-                                p.range.unwrap_or(1.0)
-                            ))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                );
-            }
-        }
-
-        if let Some(input) = cfg.input {
-            if let Some(first) = layers.first() {
-                if *first != input {
-                    self.diag.error(
-                        cfg.span,
-                        format!(
-                            "@AI(input={}) does not match network input layer {}",
-                            input, first
-                        ),
-                    );
+        if let crate::ast::Attribute::Named { args, .. } = attr {
+            // Extract architecture string from first argument
+            if let Some(crate::ast::Expr::StrLit { value, span }) = args.first() {
+                // Validate architecture string format
+                if let Err(e) = self.validate_architecture_string(value) {
+                    self.diag
+                        .error(*span, format!("@{}: {}", decorator_name.to_uppercase(), e));
+                    return;
                 }
             }
         }
 
-        if let Some(output) = cfg.output {
-            if let Some(last) = layers.last() {
-                if *last != output {
-                    self.diag.error(
-                        cfg.span,
-                        format!(
-                            "@AI(output={}) does not match network output layer {}",
-                            output, last
-                        ),
-                    );
-                }
-            }
-        }
+                // Parse layers from architecture (without full parsing yet, just validate format)
+                if let Ok(layers) = self.extract_layers_from_arch(value) {
+                    // Calculate total perception size
+                    let total_perception_size: u64 = a
+                        .perceptions
+                        .iter()
+                        .map(|p| match &p.range {
+                            Some(r) => *r as u64,
+                            None => 1,
+                        })
+                        .sum();
 
-        if let Some(lr) = cfg.learning_rate {
-            if !lr.is_finite() || lr <= 0.0 {
-                self.diag.error(
-                    cfg.span,
-                    format!("@AI learning rate must be > 0, got {}", lr),
-                );
-            }
-        }
-    }
-
-    fn extract_ai_decorator_config(
-        &mut self,
-        a: &AgentDecl,
-        attr: &crate::ast::Attribute,
-        decorator_name: &str,
-    ) -> Option<AiDecoratorConfig> {
-        let crate::ast::Attribute::Named { args, .. } = attr else {
-            return None;
-        };
-        let mut network: Option<String> = None;
-        let mut learning_rate: Option<f64> = None;
-        let mut input: Option<u64> = None;
-        let mut output: Option<u64> = None;
-        let mut span = a.span;
-
-        for (idx, arg) in args.iter().enumerate() {
-            span = arg.span();
-            match arg {
-                crate::ast::Expr::StrLit { value, .. } if idx == 0 => {
-                    network = Some(value.clone());
-                }
-                crate::ast::Expr::Assign { target, value, .. } => {
-                    let key = match target.as_ref() {
-                        crate::ast::Expr::Ident { name, .. } => name.as_str(),
-                        crate::ast::Expr::Path { segments, .. } if segments.len() == 1 => {
-                            segments[0].as_str()
-                        }
-                        _ => {
-                            self.diag.error(
-                                target.span(),
-                                "@AI options must use simple keys like `network=...`, `lr=...`, `input=...`, `output=...`",
-                            );
-                            continue;
-                        }
-                    };
-
-                    match key {
-                        "network" | "arch" | "architecture" => {
-                            if let crate::ast::Expr::StrLit { value, .. } = value.as_ref() {
-                                network = Some(value.clone());
-                            } else {
-                                self.diag.error(
-                                    value.span(),
-                                    "@AI `network` must be a string, e.g. network=\"128->64->10\"",
-                                );
-                            }
-                        }
-                        "lr" | "learning_rate" => {
-                            if let Some(v) = self.ai_number_literal(value) {
-                                learning_rate = Some(v);
-                            } else {
-                                self.diag.error(
-                                    value.span(),
-                                    "@AI `lr`/`learning_rate` must be numeric",
-                                );
-                            }
-                        }
-                        "input" => {
-                            if let Some(v) = self.ai_u64_literal(value) {
-                                input = Some(v);
-                            } else {
-                                self.diag
-                                    .error(value.span(), "@AI `input` must be an integer");
-                            }
-                        }
-                        "output" => {
-                            if let Some(v) = self.ai_u64_literal(value) {
-                                output = Some(v);
-                            } else {
-                                self.diag
-                                    .error(value.span(), "@AI `output` must be an integer");
-                            }
-                        }
-                        other => {
-                            self.diag.warning(
-                                target.span(),
-                                format!(
-                                    "@AI unknown option `{}`; supported: network, lr, input, output",
-                                    other
-                                ),
-                            );
+                    // Check if input layer matches perception size
+                    if let Some(input_size) = layers.first() {
+                        if *input_size != total_perception_size {
+                            self.diag.error(*span, format!(
+                                "@AI input layer size {} doesn't match total perception size {}. \
+                                 Perceptions: {}",
+                                *input_size,
+                                total_perception_size,
+                                a.perceptions.iter()
+                                    .map(|p| format!("{} ({})", p.tag.as_deref().unwrap_or("perception"), p.range.unwrap_or(1.0)))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
                         }
                     }
+                } else {
+                    self.diag
+                        .error(*span, "@AI architecture string format is invalid");
                 }
-                crate::ast::Expr::StrLit { value, .. } => {
-                    network = Some(value.clone());
-                }
-                _ => {}
+            } else {
+                self.diag.error(a.span, "@AI decorator requires a string literal argument (e.g., @AI(\"256->512->10\"))");
             }
         }
 
@@ -3197,15 +3047,6 @@ fn is_network_decorator(name: &str) -> bool {
     )
 }
 
-#[derive(Debug, Clone)]
-struct AiDecoratorConfig {
-    span: Span,
-    network: String,
-    learning_rate: Option<f64>,
-    input: Option<u64>,
-    output: Option<u64>,
-}
-
 // =============================================================================
 // TESTS
 // =============================================================================
@@ -3261,27 +3102,6 @@ mod tests {
 
     fn make_checker() -> TypeCk {
         TypeCk::new()
-    }
-
-    fn mk_agent_with_attrs(attrs: Vec<Attribute>) -> AgentDecl {
-        AgentDecl {
-            span: dummy(),
-            attrs,
-            name: "Bot".into(),
-            architecture: AgentArchitecture::Learned,
-            perceptions: vec![PerceptionSpec {
-                span: dummy(),
-                kind: PerceptionKind::Vision,
-                range: Some(128.0),
-                fov: None,
-                tag: Some("vision".into()),
-            }],
-            memory: None,
-            learning: None,
-            behaviors: vec![],
-            goals: vec![],
-            fields: vec![],
-        }
     }
 
     // ── Scalar literal inference ───────────────────────────────────────────────

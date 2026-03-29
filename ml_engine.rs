@@ -75,17 +75,6 @@ impl Int8LinearWeights {
         let scale_bytes = (self.scales.len() * std::mem::size_of::<f32>()) as f32;
         (weight_bytes + scale_bytes) / self.qweights.len().max(1) as f32
     }
-
-    pub fn dequantize_f32(&self) -> Vec<f32> {
-        let mut w = vec![0.0f32; self.in_dim * self.out_dim];
-        for o in 0..self.out_dim {
-            let scale = self.scales[o];
-            for i in 0..self.in_dim {
-                w[i * self.out_dim + o] = self.qweights[i * self.out_dim + o] as f32 * scale;
-            }
-        }
-        w
-    }
 }
 
 impl Tensor {
@@ -465,15 +454,6 @@ impl Tensor {
         let k = self.shape[1];
         let n = other.shape[1];
 
-        if Self::use_native_jules_kernel(m, k, n) {
-            let mut result = vec![0.0f32; m * n];
-            jules_kernel(&self.data, &other.data, m, k, n, &mut result);
-            return Tensor {
-                shape: vec![m, n],
-                data: result,
-            };
-        }
-
         let other_t = transpose_2d(&other.data, k, n);
         let mut result = vec![0.0; m * n];
 
@@ -481,8 +461,6 @@ impl Tensor {
         let threads = thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-
-        let use_blocked = m >= 64 && k >= 64 && n >= 64;
 
         if threads > 1 && ops >= Self::PARALLEL_MATMUL_MIN_OPS {
             let rows_per_chunk = m.div_ceil(threads);
@@ -494,41 +472,24 @@ impl Tensor {
                     let bt_data = &other_t;
 
                     scope.spawn(move || {
-                        if use_blocked {
-                            matmul_blocked_rows(
-                                a_data,
-                                bt_data,
-                                row_start,
-                                row_end,
-                                k,
-                                n,
-                                result_chunk,
-                                row_start,
-                            );
-                        } else {
-                            for row in row_start..row_end {
-                                let local_row = row - row_start;
-                                let out_row = &mut result_chunk[local_row * n..(local_row + 1) * n];
-                                let a_row = &a_data[row * k..(row + 1) * k];
-                                for col in 0..n {
-                                    let b_row = &bt_data[col * k..(col + 1) * k];
-                                    out_row[col] = dot_unrolled_8(a_row, b_row);
-                                }
+                        for row in row_start..row_end {
+                            let local_row = row - row_start;
+                            let out_row = &mut result_chunk[local_row * n..(local_row + 1) * n];
+                            let a_row = &a_data[row * k..(row + 1) * k];
+                            for col in 0..n {
+                                let b_row = &bt_data[col * k..(col + 1) * k];
+                                out_row[col] = dot_unrolled_8(a_row, b_row);
                             }
                         }
                     });
                 }
             });
         } else {
-            if use_blocked {
-                matmul_blocked_rows(&self.data, &other_t, 0, m, k, n, &mut result, 0);
-            } else {
-                for i in 0..m {
-                    let a_row = &self.data[i * k..(i + 1) * k];
-                    for j in 0..n {
-                        let b_row = &other_t[j * k..(j + 1) * k];
-                        result[i * n + j] = dot_unrolled_8(a_row, b_row);
-                    }
+            for i in 0..m {
+                let a_row = &self.data[i * k..(i + 1) * k];
+                for j in 0..n {
+                    let b_row = &other_t[j * k..(j + 1) * k];
+                    result[i * n + j] = dot_unrolled_8(a_row, b_row);
                 }
             }
         }
@@ -537,64 +498,6 @@ impl Tensor {
             shape: vec![m, n],
             data: result,
         }
-    }
-
-    /// Native fused linear layer: `x @ w (+ b)` with optional activation in
-    /// one post-GEMM pass. Supported activations: `"relu"`, `"tanh"`,
-    /// `"sigmoid"`, or `None`.
-    pub fn linear_native(
-        &self,
-        weights: &Tensor,
-        bias: Option<&Tensor>,
-        activation: Option<&str>,
-    ) -> Result<Tensor, String> {
-        if self.shape.len() != 2 || weights.shape.len() != 2 {
-            return Err("linear_native expects 2D input and 2D weights".into());
-        }
-        let batch = self.shape[0];
-        let in_dim = self.shape[1];
-        if weights.shape[0] != in_dim {
-            return Err("linear_native input dimension mismatch".into());
-        }
-        let out_dim = weights.shape[1];
-
-        if let Some(b) = bias {
-            if b.shape != vec![out_dim] {
-                return Err("linear_native bias must be shape [out_dim]".into());
-            }
-        }
-
-        let mut out = self.matmul(weights);
-        for row in 0..batch {
-            for col in 0..out_dim {
-                let idx = row * out_dim + col;
-                let mut v = out.data[idx];
-                if let Some(b) = bias {
-                    v += b.data[col];
-                }
-                v = match activation {
-                    Some("relu") => v.max(0.0),
-                    Some("tanh") => v.tanh(),
-                    Some("sigmoid") => 1.0 / (1.0 + (-v).exp()),
-                    Some(name) => {
-                        return Err(format!("unsupported linear_native activation '{}'", name));
-                    }
-                    None => v,
-                };
-                out.data[idx] = v;
-            }
-        }
-        Ok(out)
-    }
-
-    /// Backward-compatible alias for older examples.
-    pub fn linear_jax(
-        &self,
-        weights: &Tensor,
-        bias: Option<&Tensor>,
-        activation: Option<&str>,
-    ) -> Result<Tensor, String> {
-        self.linear_native(weights, bias, activation)
     }
 
     /// Stress helper for runtime tuning. Allocates large buffers and reports
@@ -771,78 +674,20 @@ impl Tensor {
             }
         }
 
-        let ops = batch.saturating_mul(in_dim).saturating_mul(weights.out_dim);
-        if ops >= 262_144 {
-            let w_f32 = weights.dequantize_f32();
-            let mut out = vec![0.0f32; batch * weights.out_dim];
-            jules_kernel(&self.data, &w_f32, batch, in_dim, weights.out_dim, &mut out);
-            if let Some(bias_t) = bias {
-                for b in 0..batch {
-                    for o in 0..weights.out_dim {
-                        out[b * weights.out_dim + o] += bias_t.data[o];
-                    }
-                }
-            }
-            return Ok(Tensor {
-                shape: vec![batch, weights.out_dim],
-                data: out,
-            });
-        }
-
         let mut out = vec![0.0f32; batch * weights.out_dim];
-        let threads = thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        if threads > 1 && ops >= Self::PARALLEL_MATMUL_MIN_OPS {
-            let rows_per_chunk = batch.div_ceil(threads);
-            thread::scope(|scope| {
-                for (chunk_idx, out_chunk) in
-                    out.chunks_mut(rows_per_chunk * weights.out_dim).enumerate()
-                {
-                    let row_start = chunk_idx * rows_per_chunk;
-                    let row_end = (row_start + rows_per_chunk).min(batch);
-                    let x_data = &self.data;
-                    let q_data = &weights.qweights;
-                    let scales = &weights.scales;
-                    let out_dim = weights.out_dim;
-                    let bias_ref = bias;
-                    scope.spawn(move || {
-                        for b in row_start..row_end {
-                            let local_row = b - row_start;
-                            let out_row =
-                                &mut out_chunk[local_row * out_dim..(local_row + 1) * out_dim];
-                            for o in 0..out_dim {
-                                let mut acc = 0.0f32;
-                                let scale = scales[o];
-                                for i in 0..in_dim {
-                                    let x = x_data[b * in_dim + i];
-                                    let qw = q_data[i * out_dim + o] as f32 * scale;
-                                    acc += x * qw;
-                                }
-                                if let Some(bias_t) = bias_ref {
-                                    acc += bias_t.data[o];
-                                }
-                                out_row[o] = acc;
-                            }
-                        }
-                    });
+        for b in 0..batch {
+            for o in 0..weights.out_dim {
+                let mut acc = 0.0f32;
+                let scale = weights.scales[o];
+                for i in 0..in_dim {
+                    let x = self.data[b * in_dim + i];
+                    let qw = weights.qweights[i * weights.out_dim + o] as f32 * scale;
+                    acc += x * qw;
                 }
-            });
-        } else {
-            for b in 0..batch {
-                for o in 0..weights.out_dim {
-                    let mut acc = 0.0f32;
-                    let scale = weights.scales[o];
-                    for i in 0..in_dim {
-                        let x = self.data[b * in_dim + i];
-                        let qw = weights.qweights[i * weights.out_dim + o] as f32 * scale;
-                        acc += x * qw;
-                    }
-                    if let Some(bias_t) = bias {
-                        acc += bias_t.data[o];
-                    }
-                    out[b * weights.out_dim + o] = acc;
+                if let Some(bias_t) = bias {
+                    acc += bias_t.data[o];
                 }
+                out[b * weights.out_dim + o] = acc;
             }
         }
 
@@ -851,11 +696,6 @@ impl Tensor {
             data: out,
         })
     }
-}
-
-fn jules_kernel(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, out: &mut [f32]) {
-    let b_t = transpose_2d(b, k, n);
-    matmul_blocked_rows(a, &b_t, 0, m, k, n, out, 0);
 }
 
 fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
@@ -898,7 +738,56 @@ fn matmul_blocked_rows(
                 out_row[col] = acc;
             }
         }
+
+        Ok(Tensor {
+            shape: vec![batch, weights.out_dim],
+            data: out,
+        })
     }
+}
+
+fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
+    let len = lhs.len();
+    let chunks = len / 8;
+    let mut i = 0;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let mut s4 = 0.0f32;
+    let mut s5 = 0.0f32;
+    let mut s6 = 0.0f32;
+    let mut s7 = 0.0f32;
+
+    for _ in 0..chunks {
+        s0 += lhs[i] * rhs[i];
+        s1 += lhs[i + 1] * rhs[i + 1];
+        s2 += lhs[i + 2] * rhs[i + 2];
+        s3 += lhs[i + 3] * rhs[i + 3];
+        s4 += lhs[i + 4] * rhs[i + 4];
+        s5 += lhs[i + 5] * rhs[i + 5];
+        s6 += lhs[i + 6] * rhs[i + 6];
+        s7 += lhs[i + 7] * rhs[i + 7];
+        i += 8;
+    }
+
+    let mut tail = 0.0f32;
+    while i < len {
+        tail += lhs[i] * rhs[i];
+        i += 1;
+    }
+
+    s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + tail
+}
+
+fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = data[r * cols + c];
+        }
+    }
+    out
 }
 
 fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
@@ -1144,106 +1033,6 @@ mod tests {
         }
 
         assert!(q.effective_bytes_per_param() <= 1.8);
-    }
-
-    #[test]
-    fn linear_native_matches_matmul_plus_bias() {
-        let x = Tensor {
-            shape: vec![2, 3],
-            data: vec![1.0, 2.0, 3.0, -1.0, 0.5, 2.0],
-        };
-        let w = Tensor {
-            shape: vec![3, 2],
-            data: vec![0.2, 0.1, 1.0, -0.5, 0.3, 0.7],
-        };
-        let b = Tensor {
-            shape: vec![2],
-            data: vec![0.05, -0.02],
-        };
-
-        let fused = x.linear_native(&w, Some(&b), None).expect("linear_native");
-        let expected = x.matmul(&w).add(&Tensor {
-            shape: vec![2, 2],
-            data: vec![0.05, -0.02, 0.05, -0.02],
-        });
-        for (a, b) in fused.data.iter().zip(expected.data.iter()) {
-            assert!((a - b).abs() < 1e-5);
-        }
-    }
-
-    #[test]
-    fn linear_native_relu_outputs_non_negative() {
-        let x = Tensor {
-            shape: vec![1, 3],
-            data: vec![1.0, -2.0, 0.5],
-        };
-        let w = Tensor {
-            shape: vec![3, 2],
-            data: vec![-1.0, 0.5, 0.3, -0.8, 1.2, 0.1],
-        };
-        let out = x.linear_native(&w, None, Some("relu")).expect("relu");
-        assert!(out.data.iter().all(|v| *v >= 0.0));
-    }
-
-    #[test]
-    fn layer_norm_last_dim_normalizes_rows() {
-        let x = Tensor {
-            shape: vec![2, 4],
-            data: vec![1.0, 2.0, 3.0, 4.0, -2.0, 0.0, 2.0, 4.0],
-        };
-        let y = x
-            .layer_norm_last_dim(None, None, 1e-5)
-            .expect("layer norm runs");
-        assert_eq!(y.shape, x.shape);
-
-        for row in 0..2 {
-            let base = row * 4;
-            let slice = &y.data[base..base + 4];
-            let mean = slice.iter().sum::<f32>() / 4.0;
-            assert!(mean.abs() < 1e-4, "row mean should be ~0, got {mean}");
-        }
-    }
-
-    #[test]
-    fn rms_norm_last_dim_scales_rows() {
-        let x = Tensor {
-            shape: vec![1, 4],
-            data: vec![1.0, 2.0, 3.0, 4.0],
-        };
-        let y = x.rms_norm_last_dim(None, 1e-5).expect("rms norm runs");
-        assert_eq!(y.shape, x.shape);
-        let mean_sq = y.data.iter().map(|v| v * v).sum::<f32>() / y.data.len() as f32;
-        assert!(
-            (mean_sq - 1.0).abs() < 1e-3,
-            "normalized RMS should be ~1, got {mean_sq}"
-        );
-    }
-
-    #[test]
-    fn scaled_dot_product_attention_shapes_and_causal() {
-        let q = Tensor {
-            shape: vec![1, 2, 2],
-            data: vec![1.0, 0.0, 0.0, 1.0],
-        };
-        let k = Tensor {
-            shape: vec![1, 2, 2],
-            data: vec![1.0, 0.0, 0.0, 1.0],
-        };
-        let v = Tensor {
-            shape: vec![1, 2, 2],
-            data: vec![10.0, 0.0, 0.0, 20.0],
-        };
-
-        let out_full = Tensor::scaled_dot_product_attention(&q, &k, &v, false).expect("full attn");
-        let out_causal =
-            Tensor::scaled_dot_product_attention(&q, &k, &v, true).expect("causal attn");
-
-        assert_eq!(out_full.shape, vec![1, 2, 2]);
-        assert_eq!(out_causal.shape, vec![1, 2, 2]);
-
-        // For token 0 with causal mask, only key/value 0 is visible.
-        assert!((out_causal.data[0] - 10.0).abs() < 1e-4);
-        assert!(out_causal.data[1].abs() < 1e-4);
     }
 }
 
